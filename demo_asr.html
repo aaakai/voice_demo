@@ -1,0 +1,1413 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voice agents console demo</title>
+  <style>
+    :root {
+      --bg: #eef1f5;
+      --card: #ffffff;
+      --line: #dde3ea;
+      --text: #0f1720;
+      --muted: #6c7888;
+      --user-bg: #e8f1ff;
+      --assistant-bg: #f5f7fa;
+      --assistant-border: #ced7e2;
+      --accent: #1f6fff;
+      --accent-soft: #dce8ff;
+      --danger: #c93838;
+      --shadow: 0 10px 30px rgba(15, 23, 32, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+      background: radial-gradient(circle at 20% 0%, #f7f9fc 0%, var(--bg) 46%, #e9edf3 100%);
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .shell {
+      width: min(980px, 100%);
+      height: min(90vh, 860px);
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+      display: grid;
+      grid-template-rows: auto 1fr auto auto;
+      overflow: hidden;
+    }
+
+    .top {
+      border-bottom: 1px solid var(--line);
+      padding: 18px 24px 14px;
+      background: linear-gradient(180deg, #ffffff 0%, #fafcff 100%);
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .title {
+      font-size: 24px;
+      font-weight: 650;
+      letter-spacing: 0.2px;
+      margin: 0;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      margin: 0;
+      font-size: 13px;
+    }
+
+    .tab {
+      border: 1px solid #bfd2fb;
+      background: var(--accent-soft);
+      color: #1848a8;
+      border-radius: 999px;
+      padding: 7px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .live-strip {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 10px;
+      align-items: start;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: #fbfdff;
+    }
+
+    .live-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      margin-top: 2px;
+    }
+
+    .live-text {
+      min-height: 18px;
+      color: #2a3645;
+      font-size: 14px;
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
+
+    .timeline {
+      overflow-y: auto;
+      padding: 18px 22px 14px;
+      background: linear-gradient(180deg, #fcfdff 0%, #f9fbff 100%);
+    }
+
+    .messages {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 12px;
+    }
+
+    .msg-row { display: flex; }
+    .msg-row.user { justify-content: flex-end; }
+    .msg-row.assistant { justify-content: flex-start; }
+
+    .msg {
+      max-width: min(78%, 720px);
+      border-radius: 14px;
+      padding: 10px 12px;
+      border: 1px solid transparent;
+      word-break: break-word;
+      box-shadow: 0 1px 0 rgba(15, 23, 32, 0.04);
+    }
+
+    .msg.user {
+      background: var(--user-bg);
+      border-color: #cfe1ff;
+    }
+
+    .msg.assistant {
+      background: var(--assistant-bg);
+      border-color: var(--assistant-border);
+    }
+
+    .meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .speaker {
+      color: #334155;
+      font-weight: 600;
+    }
+
+    .status-pill {
+      font-size: 11px;
+      border-radius: 999px;
+      padding: 2px 8px;
+      border: 1px solid #d6deea;
+      background: #fff;
+      color: #66758b;
+    }
+
+    .status-pill.streaming { border-color: #acd0ff; color: #1f5ec7; background: #ebf3ff; }
+    .status-pill.speaking { border-color: #9ec2ff; color: #1848a8; background: #dfebff; }
+    .status-pill.done { border-color: #cfd8e5; color: #5f6f85; background: #f6f8fb; }
+    .status-pill.interrupted { border-color: #f0c1c1; color: var(--danger); background: #fff2f2; }
+
+    .body {
+      font-size: 14px;
+      line-height: 1.55;
+      color: #1d2837;
+      white-space: pre-wrap;
+    }
+
+    .controls {
+      border-top: 1px solid var(--line);
+      padding: 14px 20px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      background: #ffffff;
+    }
+
+    .stat {
+      border: 1px solid var(--line);
+      background: #f9fbfe;
+      border-radius: 10px;
+      padding: 8px 10px;
+      min-width: 128px;
+    }
+
+    .stat-key {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      margin-bottom: 2px;
+    }
+
+    .stat-val {
+      font-size: 13px;
+      color: #1f2d3d;
+      font-weight: 600;
+      word-break: break-all;
+    }
+
+    .spacer { flex: 1; min-width: 10px; }
+
+    button {
+      border-radius: 10px;
+      border: 1px solid #cdd6e3;
+      background: #fff;
+      color: #233245;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 9px 14px;
+      cursor: pointer;
+    }
+
+    button:hover { background: #f6f9ff; }
+
+    .btn-start { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .btn-start:hover { background: #1a5edf; }
+
+    .btn-stop {
+      color: #912f2f;
+      border-color: #e6bbbb;
+      background: #fff6f6;
+    }
+
+    .debug-wrap {
+      border-top: 1px solid var(--line);
+      padding: 8px 12px 12px;
+      background: #f8fafc;
+    }
+
+    details {
+      border: 1px dashed #cfd8e4;
+      border-radius: 10px;
+      background: #fcfdff;
+      padding: 6px 8px;
+    }
+
+    summary {
+      cursor: pointer;
+      color: #52627a;
+      font-size: 12px;
+      font-weight: 600;
+      outline: none;
+      user-select: none;
+    }
+
+    .debug-grid {
+      margin-top: 8px;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+
+    .debug-card {
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      background: #fff;
+      overflow: hidden;
+    }
+
+    .debug-head {
+      background: #f2f6fb;
+      color: #51627a;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+      text-transform: uppercase;
+      padding: 6px 8px;
+      border-bottom: 1px solid #e2e8f0;
+    }
+
+    .debug-body {
+      margin: 0;
+      padding: 8px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      color: #324258;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 160px;
+      overflow: auto;
+    }
+
+    .empty {
+      text-align: center;
+      color: #7b8797;
+      font-size: 13px;
+      border: 1px dashed #d4dbe7;
+      border-radius: 12px;
+      padding: 26px 10px;
+      background: #ffffff;
+    }
+
+    @media (max-width: 780px) {
+      body { padding: 10px; }
+      .shell { height: 95vh; border-radius: 16px; }
+      .title { font-size: 20px; }
+      .msg { max-width: 92%; }
+      .stat { min-width: calc(50% - 8px); }
+      .controls { padding: 12px; }
+      .top { padding: 14px 14px 10px; }
+      .timeline { padding: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <div class="topbar">
+        <div>
+          <h1 class="title">Voice agents</h1>
+          <p class="subtitle">Realtime voice interaction demo</p>
+        </div>
+        <div class="tab">Voice agents</div>
+      </div>
+      <div class="live-strip">
+        <div class="live-label">Live transcript</div>
+        <div class="live-text" id="liveTranscript">-</div>
+      </div>
+    </header>
+
+    <section class="timeline" id="timeline">
+      <ul class="messages" id="messages"></ul>
+      <div class="empty" id="emptyHint">点击 Start Listening 后开始说话，assistant 会边生成边播报。</div>
+    </section>
+
+    <section class="controls">
+      <div class="stat">
+        <span class="stat-key">Session</span>
+        <span class="stat-val" id="sessionTimer">00:00</span>
+      </div>
+      <div class="stat">
+        <span class="stat-key">Mic</span>
+        <span class="stat-val" id="micState">idle</span>
+      </div>
+      <div class="stat">
+        <span class="stat-key">Playback</span>
+        <span class="stat-val" id="playbackState">idle</span>
+      </div>
+      <div class="stat" style="min-width:200px;">
+        <span class="stat-key">Turn ID</span>
+        <span class="stat-val" id="turnState">-</span>
+      </div>
+      <div class="spacer"></div>
+      <button class="btn-start" id="startBtn">Start Listening</button>
+      <button class="btn-stop" id="stopBtn">Stop</button>
+      <button id="clearBtn">Clear</button>
+    </section>
+
+    <section class="debug-wrap">
+      <details>
+        <summary>Debug</summary>
+        <div class="debug-grid">
+          <div class="debug-card">
+            <div class="debug-head">Last /decide</div>
+            <pre class="debug-body" id="decideDebug">{}</pre>
+          </div>
+          <div class="debug-card">
+            <div class="debug-head">Stream status</div>
+            <pre class="debug-body" id="streamDebug">{}</pre>
+          </div>
+          <div class="debug-card">
+            <div class="debug-head">Agent state</div>
+            <pre class="debug-body" id="agentDebug">{}</pre>
+          </div>
+        </div>
+      </details>
+    </section>
+  </main>
+
+  <script>
+    const liveTranscriptEl = document.getElementById("liveTranscript");
+    const messagesEl = document.getElementById("messages");
+    const emptyHintEl = document.getElementById("emptyHint");
+    const timelineEl = document.getElementById("timeline");
+
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const clearBtn = document.getElementById("clearBtn");
+
+    const sessionTimerEl = document.getElementById("sessionTimer");
+    const micStateEl = document.getElementById("micState");
+    const playbackStateEl = document.getElementById("playbackState");
+    const turnStateEl = document.getElementById("turnState");
+
+    const decideDebugEl = document.getElementById("decideDebug");
+    const streamDebugEl = document.getElementById("streamDebug");
+    const agentDebugEl = document.getElementById("agentDebug");
+
+    const API_BASE = "http://127.0.0.1:8000";
+    const OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls";
+
+    let sessionId = "web-demo-s1";
+    let messages = [];
+
+    let currentStreamController = null;
+    let currentTurnId = null;
+    let activeAssistantMessageId = null;
+    let conversationMode = "chat";
+    let storyAutoContinueCount = 0;
+    const STORY_AUTO_CONTINUE_MAX = 2;
+
+    // TTS queue
+    let speechQueue = [];
+    let isSpeakingChunk = false;
+    let assistantSpeaking = false;
+    let playbackStage = "idle";
+    let ttsBufferText = "";
+    let ttsBufferTurnId = null;
+    let ttsFlushTimer = null;
+
+    // Realtime connection state
+    let shouldKeepListening = false;
+    let recognitionRunning = false;
+    let recognitionStarting = false;
+    let recognitionState = "idle";
+    let rtcRestartTimer = null;
+
+    let rtcPc = null;
+    let rtcDc = null;
+    let micStream = null;
+    let remoteAudioEl = null;
+    let realtimeModel = "gpt-realtime";
+
+    // transcript buffer per turn
+    let currentTranscript = "";
+    let currentCompletedTranscript = "";
+    let lastFinalizeSource = "none";
+    let activeInputItemId = null;
+
+    // anti-echo interrupt guards
+    let pendingInterrupt = false;
+    let pendingInterruptStartedAt = 0;
+    let interruptCandidateTranscript = "";
+    let recentAssistantText = "";
+    let ignoreEchoUntil = 0;
+
+    // NEW: backchannel engine state
+    let userSpeaking = false;
+    let lastSpeechStartedAt = 0;
+    let lastTranscriptUpdateAt = 0;
+    let activeUserTranscript = "";
+    let assistantInterjectCooldownUntil = 0;
+
+    // turn finalize guards
+    let finalizeTurnTimer = null;
+    let pendingFinalize = false;
+    let finalizingUserTurn = false;
+
+    let sessionTimerSec = 0;
+    let timerHandle = null;
+
+    function nowTime() {
+      const d = new Date();
+      return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
+    }
+
+    function formatDuration(seconds) {
+      const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
+      const ss = String(seconds % 60).padStart(2, "0");
+      return `${mm}:${ss}`;
+    }
+
+    function startTimer() {
+      if (timerHandle) return;
+      timerHandle = setInterval(() => {
+        sessionTimerSec += 1;
+        sessionTimerEl.textContent = formatDuration(sessionTimerSec);
+      }, 1000);
+    }
+
+    function stopTimer() {
+      if (!timerHandle) return;
+      clearInterval(timerHandle);
+      timerHandle = null;
+    }
+
+    function updateStatus() {
+      const rtcConnectionState = rtcPc ? rtcPc.connectionState : "closed";
+      const rtcDataChannelOpen = !!rtcDc && rtcDc.readyState === "open";
+      micStateEl.textContent = recognitionState;
+      playbackStateEl.textContent = assistantSpeaking ? playbackStage : "idle";
+      turnStateEl.textContent = currentTurnId || "-";
+
+      agentDebugEl.textContent = JSON.stringify(
+        {
+          recognition_state: recognitionState,
+          recognition_running: recognitionRunning,
+          recognition_starting: recognitionStarting,
+          should_keep_listening: shouldKeepListening,
+          assistant_speaking: assistantSpeaking,
+          playback_stage: playbackStage,
+          tts_queue: speechQueue.length,
+          tts_playing: isSpeakingChunk,
+          tts_buffer_text: ttsBufferText,
+          realtime_connected: !!rtcPc && rtcPc.connectionState === "connected",
+          currentTranscript: currentTranscript,
+          currentCompletedTranscript: currentCompletedTranscript,
+          last_finalize_source: lastFinalizeSource,
+          active_input_item_id: activeInputItemId,
+          pending_finalize: pendingFinalize,
+          finalizing_user_turn: finalizingUserTurn,
+          pending_interrupt: pendingInterrupt,
+          recent_assistant_text: recentAssistantText,
+          ignore_echo_until: ignoreEchoUntil,
+          // NEW: backchannel debug state
+          user_speaking: userSpeaking,
+          last_speech_started_at: lastSpeechStartedAt,
+          last_transcript_update_at: lastTranscriptUpdateAt,
+          active_user_transcript: activeUserTranscript,
+          assistant_interject_cooldown_until: assistantInterjectCooldownUntil,
+          rtc_connection_state: rtcConnectionState,
+          rtc_data_channel_open: rtcDataChannelOpen,
+          current_turn_id: currentTurnId,
+          conversation_mode: conversationMode,
+          story_auto_continue_count: storyAutoContinueCount,
+        },
+        null,
+        2
+      );
+    }
+
+    function setRecognitionState(v) {
+      recognitionState = v;
+      updateStatus();
+    }
+
+    function setLiveTranscript(text) {
+      liveTranscriptEl.textContent = text && text.trim() ? text : "-";
+    }
+
+    function appendMessage(role, text, extra = {}) {
+      const id = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+      messages.push({
+        id,
+        role,
+        time: nowTime(),
+        text: text || "",
+        status: extra.status || (role === "assistant" ? "streaming" : "done"),
+        turnId: extra.turnId || null
+      });
+      renderMessages();
+      return messages[messages.length - 1];
+    }
+
+    function updateMessage(id, patch) {
+      const msg = messages.find((m) => m.id === id);
+      if (!msg) return;
+      Object.assign(msg, patch);
+      renderMessages();
+    }
+
+    function renderMessages() {
+      messagesEl.innerHTML = "";
+      emptyHintEl.style.display = messages.length ? "none" : "block";
+
+      for (const m of messages) {
+        const row = document.createElement("li");
+        row.className = `msg-row ${m.role}`;
+
+        const bubble = document.createElement("article");
+        bubble.className = `msg ${m.role}`;
+
+        const meta = document.createElement("div");
+        meta.className = "meta";
+
+        const speaker = document.createElement("span");
+        speaker.className = "speaker";
+        speaker.textContent = m.role === "user" ? "User" : "Assistant";
+
+        const right = document.createElement("div");
+        right.style.display = "flex";
+        right.style.alignItems = "center";
+        right.style.gap = "8px";
+
+        const time = document.createElement("span");
+        time.textContent = m.time;
+        right.appendChild(time);
+
+        if (m.role === "assistant") {
+          const status = document.createElement("span");
+          status.className = `status-pill ${m.status || "done"}`;
+          status.textContent = m.status || "done";
+          right.appendChild(status);
+        }
+
+        meta.appendChild(speaker);
+        meta.appendChild(right);
+
+        const body = document.createElement("div");
+        body.className = "body";
+        body.textContent = m.text || "...";
+
+        bubble.appendChild(meta);
+        bubble.appendChild(body);
+        row.appendChild(bubble);
+        messagesEl.appendChild(row);
+      }
+
+      timelineEl.scrollTop = timelineEl.scrollHeight;
+    }
+
+    function clearTTSQueue() {
+      if (ttsFlushTimer) {
+        clearTimeout(ttsFlushTimer);
+        ttsFlushTimer = null;
+      }
+      ttsBufferText = "";
+      ttsBufferTurnId = null;
+      speechQueue = [];
+      isSpeakingChunk = false;
+      window.speechSynthesis.cancel();
+      assistantSpeaking = false;
+      playbackStage = "idle";
+      updateStatus();
+    }
+
+    function normalizeEchoText(text) {
+      return (text || "")
+        .toLowerCase()
+        .replace(/[，。！？、,.!?;；:\s"'“”‘’\-—（）()【】\[\]<>《》]/g, "")
+        .trim();
+    }
+
+    function isLikelyEcho(text) {
+      const t = normalizeEchoText(text);
+      const r = normalizeEchoText(recentAssistantText);
+      if (!t || t.length < 2 || !r) return false;
+      return r.includes(t) || t.includes(r.slice(Math.max(0, r.length - 8)));
+    }
+
+    function pushRecentAssistantText(text) {
+      if (!text) return;
+      recentAssistantText = (recentAssistantText + text).slice(-80);
+    }
+
+    // NEW: backchannel engine
+    function maybeBackchannel() {
+      if (!userSpeaking) return;
+      if (assistantSpeaking) return;
+      if (Date.now() < assistantInterjectCooldownUntil) return;
+
+      const text = (activeUserTranscript || "").trim();
+      if (text.length < 6) return;
+
+      const pause = Date.now() - lastTranscriptUpdateAt;
+      if (pause < 600 || pause > 1500) return;
+
+      const candidates = ["嗯", "好的", "明白", "我在听", "继续说"];
+      const reply = candidates[Math.floor(Math.random() * candidates.length)];
+      enqueueTTS(reply, currentTurnId || "backchannel");
+      assistantInterjectCooldownUntil = Date.now() + 3000;
+
+      console.log("[Backchannel triggered]", {
+        transcript: activeUserTranscript,
+        pause,
+      });
+    }
+
+    function detectStoryIntent(text) {
+      const t = (text || "").trim();
+      if (!t) return false;
+      const patterns = ["讲个故事", "开始讲吧", "继续讲", "说下去", "然后呢"];
+      return patterns.some((p) => t.includes(p));
+    }
+
+    function isStoryOpeningOnly(text) {
+      const t = (text || "").trim();
+      if (!t) return false;
+      if (t.length > 28) return false;
+      const openingPatterns = [
+        "好的，那我开始讲啦",
+        "那我开始了",
+        "好，我们开始",
+        "好的，我开始讲",
+        "那我开始讲",
+      ];
+      return openingPatterns.some((p) => t.includes(p));
+    }
+
+    function stopCurrentPlayback(reason = "manual") {
+      if (currentStreamController) {
+        currentStreamController.abort();
+        currentStreamController = null;
+      }
+      clearTTSQueue();
+
+      if (activeAssistantMessageId) {
+        updateMessage(activeAssistantMessageId, { status: "interrupted" });
+      }
+
+      streamDebugEl.textContent = JSON.stringify(
+        { phase: "stopped", reason, turn_id: currentTurnId },
+        null,
+        2
+      );
+    }
+
+    function flushTTSBuffer() {
+      if (!ttsBufferText.trim()) return;
+      speechQueue.push({ text: ttsBufferText.trim(), turnId: ttsBufferTurnId });
+      ttsBufferText = "";
+      ttsBufferTurnId = null;
+      playNextTTSChunk();
+      updateStatus();
+    }
+
+    function enqueueTTS(text, turnId) {
+      if (!text || !text.trim()) return;
+
+      const normalizedTurnId = turnId || "backchannel";
+      if (ttsBufferTurnId && ttsBufferTurnId !== normalizedTurnId) {
+        flushTTSBuffer();
+      }
+
+      ttsBufferTurnId = normalizedTurnId;
+      ttsBufferText += text;
+
+      const trimmed = ttsBufferText.trim();
+      const endsStrong = /[。！？!?\n]$/.test(trimmed);
+      const endsWeak = /[，、,；;]$/.test(trimmed);
+      const shouldFlushNow =
+        endsStrong ||
+        (endsWeak && trimmed.length >= 14) ||
+        trimmed.length >= 30;
+
+      if (ttsFlushTimer) {
+        clearTimeout(ttsFlushTimer);
+        ttsFlushTimer = null;
+      }
+
+      if (shouldFlushNow) {
+        flushTTSBuffer();
+      } else {
+        ttsFlushTimer = setTimeout(() => {
+          ttsFlushTimer = null;
+          flushTTSBuffer();
+        }, 320);
+      }
+
+      updateStatus();
+    }
+
+    function playNextTTSChunk() {
+      if (isSpeakingChunk) return;
+      if (!speechQueue.length) return;
+
+      const next = speechQueue.shift();
+      const validTurn = next && (next.turnId === currentTurnId || next.turnId === "backchannel");
+      if (!next || !next.text || !validTurn) {
+        playNextTTSChunk();
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(next.text);
+      utterance.lang = "zh-CN";
+      utterance.rate = 1.0;
+      utterance.pitch = 1.0;
+      utterance.volume = 1.0;
+
+      const wasSpeaking = assistantSpeaking;
+      isSpeakingChunk = true;
+      assistantSpeaking = true;
+      playbackStage = "tts_streaming";
+      if (!wasSpeaking) {
+        ignoreEchoUntil = Date.now() + 1200;
+      }
+      console.log("[TTS speak]", next.text);
+      if (activeAssistantMessageId) {
+        updateMessage(activeAssistantMessageId, { status: "speaking" });
+      }
+      updateStatus();
+
+      utterance.onend = () => {
+        isSpeakingChunk = false;
+        if (speechQueue.length > 0) {
+          playNextTTSChunk();
+          return;
+        }
+        assistantSpeaking = false;
+        playbackStage = "idle";
+        if (activeAssistantMessageId) {
+          const target = messages.find((m) => m.id === activeAssistantMessageId);
+          if (target && target.status !== "interrupted") {
+            updateMessage(activeAssistantMessageId, { status: "done" });
+          }
+        }
+        updateStatus();
+      };
+
+      utterance.onerror = () => {
+        isSpeakingChunk = false;
+        assistantSpeaking = false;
+        playbackStage = "idle";
+        if (activeAssistantMessageId) {
+          updateMessage(activeAssistantMessageId, { status: "interrupted" });
+        }
+        updateStatus();
+      };
+
+      window.speechSynthesis.speak(utterance);
+    }
+
+    async function streamReply(userText, opts = {}) {
+      const mode = opts.mode || conversationMode || "chat";
+      const isAutoContinue = !!opts.isAutoContinue;
+
+      if (currentStreamController) {
+        currentStreamController.abort();
+      }
+
+      currentStreamController = new AbortController();
+
+      const resp = await fetch(`${API_BASE}/stream_reply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, user_text: userText, mode }),
+        signal: currentStreamController.signal
+      });
+
+      if (!resp.ok) {
+        const txt = await resp.text();
+        throw new Error(`/stream_reply failed: ${resp.status} ${txt}`);
+      }
+      if (!resp.body) {
+        throw new Error("No response body from /stream_reply");
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+      let myTurnId = null;
+      let localAssistantMsgId = null;
+      let fullReply = "";
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+
+            let chunk;
+            try {
+              chunk = JSON.parse(line);
+            } catch {
+              continue;
+            }
+
+            if (chunk.type === "start") {
+              myTurnId = chunk.turn_id;
+              currentTurnId = myTurnId;
+              fullReply = "";
+              localAssistantMsgId = appendMessage("assistant", "", {
+                status: "streaming",
+                turnId: myTurnId
+              }).id;
+              activeAssistantMessageId = localAssistantMsgId;
+              updateStatus();
+              continue;
+            }
+
+            if (myTurnId && chunk.turn_id && chunk.turn_id !== currentTurnId) {
+              continue;
+            }
+            if (!localAssistantMsgId) continue;
+
+            if (chunk.type === "chunk") {
+              fullReply += chunk.text || "";
+              pushRecentAssistantText(chunk.text || "");
+              updateMessage(localAssistantMsgId, {
+                text: fullReply,
+                status: assistantSpeaking ? "speaking" : "streaming"
+              });
+              enqueueTTS(chunk.text || "", myTurnId);
+
+              streamDebugEl.textContent = JSON.stringify(
+                { phase: "streaming", turn_id: myTurnId, response_text: fullReply },
+                null,
+                2
+              );
+            }
+
+            if (chunk.type === "cancelled") {
+              clearTTSQueue();
+              updateMessage(localAssistantMsgId, { status: "interrupted" });
+              streamDebugEl.textContent = JSON.stringify(
+                { phase: "cancelled", turn_id: chunk.turn_id, response_text: fullReply },
+                null,
+                2
+              );
+              return;
+            }
+
+            if (chunk.type === "done") {
+              if (chunk.turn_id !== currentTurnId) return;
+
+              updateMessage(localAssistantMsgId, {
+                text: chunk.full_text || fullReply,
+                status: isSpeakingChunk || speechQueue.length > 0 ? "speaking" : "done"
+              });
+
+              streamDebugEl.textContent = JSON.stringify(
+                { phase: "done", turn_id: currentTurnId, response_text: chunk.full_text || fullReply },
+                null,
+                2
+              );
+
+              const doneText = (chunk.full_text || fullReply || "").trim();
+              if (
+                mode === "storytelling" &&
+                isStoryOpeningOnly(doneText) &&
+                storyAutoContinueCount < STORY_AUTO_CONTINUE_MAX &&
+                currentTurnId === myTurnId
+              ) {
+                storyAutoContinueCount += 1;
+                setTimeout(() => {
+                  if (currentTurnId !== myTurnId) return;
+                  streamReply("继续", { mode: "storytelling", isAutoContinue: true }).catch((err) => {
+                    streamDebugEl.textContent = JSON.stringify(
+                      { phase: "story_auto_continue_error", error: err.message },
+                      null,
+                      2
+                    );
+                  });
+                }, 120);
+              } else if (!isAutoContinue) {
+                storyAutoContinueCount = 0;
+              }
+            }
+          }
+        }
+      } catch (err) {
+        if (err.name === "AbortError") {
+          clearTTSQueue();
+          if (localAssistantMsgId) {
+            updateMessage(localAssistantMsgId, { status: "interrupted" });
+          }
+          streamDebugEl.textContent = JSON.stringify(
+            { phase: "aborted", turn_id: currentTurnId },
+            null,
+            2
+          );
+        } else {
+          streamDebugEl.textContent = JSON.stringify(
+            { phase: "stream_error", error: err.message },
+            null,
+            2
+          );
+        }
+      }
+    }
+
+    function clearRealtimeRestartTimer() {
+      if (!rtcRestartTimer) return;
+      clearTimeout(rtcRestartTimer);
+      rtcRestartTimer = null;
+    }
+
+    function clearFinalizeTurnTimer() {
+      if (!finalizeTurnTimer) return;
+      clearTimeout(finalizeTurnTimer);
+      finalizeTurnTimer = null;
+    }
+
+    function scheduleFinalizeUserTurn(delay = 250) {
+      if (finalizingUserTurn) return;
+      clearFinalizeTurnTimer();
+      pendingFinalize = true;
+      finalizeTurnTimer = setTimeout(() => {
+        finalizeTurnTimer = null;
+        finalizeUserTurn().catch((err) => {
+          streamDebugEl.textContent = JSON.stringify(
+            { phase: "finalize_error", error: err.message },
+            null,
+            2
+          );
+        });
+      }, delay);
+    }
+
+    function scheduleRealtimeRestart(delayMs = 500) {
+      if (!shouldKeepListening) return;
+      if (recognitionRunning || recognitionStarting) return;
+      clearRealtimeRestartTimer();
+      rtcRestartTimer = setTimeout(() => {
+        rtcRestartTimer = null;
+        if (!shouldKeepListening) return;
+        startRecognitionSafely();
+      }, delayMs);
+    }
+
+    function resetTranscriptTurnBuffer() {
+      currentTranscript = "";
+      currentCompletedTranscript = "";
+      activeInputItemId = null;
+      // NEW: backchannel transcript lifecycle
+      activeUserTranscript = "";
+      setLiveTranscript("");
+    }
+
+    async function getRealtimeSession() {
+      const resp = await fetch(`${API_BASE}/realtime/session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId })
+      });
+
+      if (!resp.ok) {
+        const txt = await resp.text();
+        throw new Error(`/realtime/session failed: ${resp.status} ${txt}`);
+      }
+      return resp.json();
+    }
+
+    async function openRealtimeConnection() {
+      const data = await getRealtimeSession();
+      const clientSecret = data.client_secret;
+      realtimeModel = data.model || realtimeModel;
+
+      if (!clientSecret) {
+        throw new Error("missing realtime client_secret");
+      }
+
+      rtcPc = new RTCPeerConnection();
+
+      remoteAudioEl = remoteAudioEl || document.createElement("audio");
+      remoteAudioEl.autoplay = true;
+      remoteAudioEl.muted = true;
+      remoteAudioEl.style.display = "none";
+      if (!remoteAudioEl.parentNode) {
+        document.body.appendChild(remoteAudioEl);
+      }
+
+      rtcPc.ontrack = (event) => {
+        remoteAudioEl.srcObject = event.streams[0];
+        remoteAudioEl.play().catch(() => {});
+      };
+
+      rtcPc.onconnectionstatechange = () => {
+        const st = rtcPc.connectionState;
+        console.log("[Realtime pc connectionstatechange]", st);
+        if (st === "connected") {
+          recognitionRunning = true;
+          recognitionStarting = false;
+          setRecognitionState("listening");
+        } else if (st === "failed" || st === "disconnected" || st === "closed") {
+          recognitionRunning = false;
+          recognitionStarting = false;
+          setRecognitionState("idle");
+          if (shouldKeepListening) {
+            scheduleRealtimeRestart(800);
+          }
+        }
+      };
+
+      rtcDc = rtcPc.createDataChannel("oai-events");
+      rtcDc.onmessage = (ev) => handleRealtimeEvent(ev.data);
+      rtcDc.onopen = () => {
+        console.log("[Realtime dc open]");
+        setRecognitionState("listening");
+      };
+      rtcDc.onclose = () => {
+        console.log("[Realtime dc close]");
+        if (shouldKeepListening) scheduleRealtimeRestart(800);
+      };
+      rtcDc.onerror = (err) => {
+        console.log("[Realtime dc error]", err);
+      };
+
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+
+      for (const track of micStream.getTracks()) {
+        rtcPc.addTrack(track, micStream);
+      }
+
+      const offer = await rtcPc.createOffer();
+      await rtcPc.setLocalDescription(offer);
+
+      const sdpResp = await fetch(
+        `${OPENAI_REALTIME_CALLS_URL}?model=${encodeURIComponent(realtimeModel)}`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${clientSecret}`,
+            "Content-Type": "application/sdp"
+          },
+          body: offer.sdp
+        }
+      );
+
+      if (!sdpResp.ok) {
+        const txt = await sdpResp.text();
+        throw new Error(`realtime webrtc failed: ${sdpResp.status} ${txt}`);
+      }
+
+      const answer = await sdpResp.text();
+      await rtcPc.setRemoteDescription({ type: "answer", sdp: answer });
+    }
+
+    function closeRealtimeConnection() {
+      try { if (rtcDc) rtcDc.close(); } catch {}
+      try { if (rtcPc) rtcPc.close(); } catch {}
+
+      rtcDc = null;
+      rtcPc = null;
+
+      if (micStream) {
+        for (const t of micStream.getTracks()) t.stop();
+      }
+      micStream = null;
+
+      recognitionRunning = false;
+      recognitionStarting = false;
+      setRecognitionState("idle");
+    }
+
+    async function startRecognitionSafely() {
+      if (!shouldKeepListening) return;
+      if (recognitionRunning || recognitionStarting) return;
+
+      recognitionStarting = true;
+      setRecognitionState("connecting");
+
+      try {
+        await openRealtimeConnection();
+      } catch (err) {
+        recognitionStarting = false;
+        recognitionRunning = false;
+        setRecognitionState("error");
+        streamDebugEl.textContent = JSON.stringify(
+          { phase: "realtime_connect_error", error: err.message },
+          null,
+          2
+        );
+        closeRealtimeConnection();
+        if (shouldKeepListening) scheduleRealtimeRestart(1200);
+      }
+    }
+
+    function stopRecognitionSafely() {
+      clearRealtimeRestartTimer();
+      closeRealtimeConnection();
+      setRecognitionState("idle");
+    }
+
+    async function finalizeUserTurn() {
+      if (finalizingUserTurn) return;
+      finalizingUserTurn = true;
+
+      clearFinalizeTurnTimer();
+      pendingFinalize = false;
+      pendingInterrupt = false;
+      interruptCandidateTranscript = "";
+
+      try {
+        const completedText = (currentCompletedTranscript || "").trim();
+        const fallbackText = (currentTranscript || activeUserTranscript || "").trim();
+        let finalizeSource = "none";
+        let finalText = "";
+        if (completedText) {
+          finalizeSource = "completed";
+          finalText = completedText;
+        } else if (fallbackText) {
+          finalizeSource = "fallback";
+          finalText = fallbackText;
+        }
+        lastFinalizeSource = finalizeSource;
+        console.log("[Finalize source]", {
+          source: finalizeSource,
+          completed: completedText,
+          fallback: fallbackText,
+        });
+
+        resetTranscriptTurnBuffer();
+        if (!finalText) return;
+        if (finalText.length <= 6 && isLikelyEcho(finalText)) {
+          streamDebugEl.textContent = JSON.stringify(
+            { phase: "echo_filtered_finalize", text: finalText },
+            null,
+            2
+          );
+          return;
+        }
+
+        if (detectStoryIntent(finalText)) {
+          conversationMode = "storytelling";
+        } else if (conversationMode !== "storytelling") {
+          conversationMode = "chat";
+        }
+        storyAutoContinueCount = 0;
+
+        appendMessage("user", finalText, { status: "done" });
+
+        streamReply(finalText, { mode: conversationMode }).catch((err) => {
+          streamDebugEl.textContent = JSON.stringify(
+            { phase: "stream_reply_error", error: err.message },
+            null,
+            2
+          );
+        });
+      } finally {
+        finalizingUserTurn = false;
+        updateStatus();
+      }
+    }
+
+    function handleRealtimeEvent(raw) {
+      console.log("[Realtime raw event]", raw);
+      let evt;
+      try {
+        evt = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      console.log("[Realtime event parsed]", evt);
+
+      // speech_started: earliest interrupt point
+      if (evt.type === "input_audio_buffer.speech_started") {
+        // 新一轮语音开始，取消上一轮挂起 finalize
+        clearFinalizeTurnTimer();
+        pendingFinalize = false;
+
+        activeInputItemId = evt.item_id || activeInputItemId;
+        currentTranscript = "";
+        currentCompletedTranscript = "";
+        setLiveTranscript("");
+        // NEW: user speech turn state
+        userSpeaking = true;
+        lastSpeechStartedAt = Date.now();
+        activeUserTranscript = "";
+
+        const speakingNow = assistantSpeaking || isSpeakingChunk || speechQueue.length > 0;
+        if (speakingNow) {
+          pendingInterrupt = true;
+          pendingInterruptStartedAt = Date.now();
+          interruptCandidateTranscript = "";
+        } else {
+          pendingInterrupt = false;
+          interruptCandidateTranscript = "";
+        }
+
+        streamDebugEl.textContent = JSON.stringify(
+          { phase: "realtime_speech_started", event: evt },
+          null,
+          2
+        );
+        updateStatus();
+        return;
+      }
+
+      // transcript delta
+      if (
+        evt.type === "conversation.item.input_audio_transcription.delta" ||
+        evt.type === "input_audio_transcription.delta"
+      ) {
+        if (evt.item_id) activeInputItemId = evt.item_id;
+        const delta = evt.delta || "";
+        if (delta) {
+          currentTranscript += delta;
+          // NEW: accumulate backchannel transcript
+          activeUserTranscript += delta;
+          lastTranscriptUpdateAt = Date.now();
+          setLiveTranscript(currentTranscript);
+
+          if (pendingInterrupt) {
+            interruptCandidateTranscript = currentTranscript.trim();
+            const elapsed = Date.now() - pendingInterruptStartedAt;
+            const thresholdHit = elapsed >= 400 || interruptCandidateTranscript.length >= 3;
+            if (thresholdHit) {
+              const inEchoWindow = Date.now() <= ignoreEchoUntil;
+              const likelyEcho = isLikelyEcho(interruptCandidateTranscript);
+              if (likelyEcho && inEchoWindow) {
+                pendingInterrupt = false;
+                interruptCandidateTranscript = "";
+                streamDebugEl.textContent = JSON.stringify(
+                  { phase: "echo_ignored_interrupt", transcript: currentTranscript },
+                  null,
+                  2
+                );
+              } else {
+                pendingInterrupt = false;
+                interruptCandidateTranscript = "";
+                stopCurrentPlayback("confirmed_user_interrupt");
+              }
+            }
+          }
+
+          // NEW: try short assistant interjection while user still speaking
+          maybeBackchannel();
+        }
+        return;
+      }
+
+      // transcript completed
+      if (
+        evt.type === "conversation.item.input_audio_transcription.completed" ||
+        evt.type === "input_audio_transcription.completed"
+      ) {
+        const transcript = (evt.transcript || "").trim();
+        if (transcript) {
+          currentCompletedTranscript = transcript;
+          // NEW: keep user-side active transcript up-to-date
+          activeUserTranscript = transcript;
+          setLiveTranscript(transcript);
+        }
+
+        // 若已收到 speech_stopped，completed 到达后立即 finalize
+        if (pendingFinalize) {
+          clearFinalizeTurnTimer();
+          finalizeUserTurn().catch((err) => {
+            streamDebugEl.textContent = JSON.stringify(
+              { phase: "finalize_error", error: err.message },
+              null,
+              2
+            );
+          });
+        }
+        return;
+      }
+
+      // speech_stopped: 先调度 finalize，给 completed 留出到达窗口
+      if (evt.type === "input_audio_buffer.speech_stopped") {
+        // NEW: user speech turn state
+        userSpeaking = false;
+        scheduleFinalizeUserTurn(250);
+        updateStatus();
+      }
+    }
+
+    startBtn.onclick = () => {
+      shouldKeepListening = true;
+      startTimer();
+      startRecognitionSafely();
+    };
+
+    stopBtn.onclick = () => {
+      shouldKeepListening = false;
+      stopRecognitionSafely();
+      clearFinalizeTurnTimer();
+      pendingFinalize = false;
+      storyAutoContinueCount = 0;
+      stopCurrentPlayback("manual_stop");
+      stopTimer();
+      setRecognitionState("idle");
+      updateStatus();
+    };
+
+    clearBtn.onclick = () => {
+      shouldKeepListening = false;
+      stopRecognitionSafely();
+      clearFinalizeTurnTimer();
+      pendingFinalize = false;
+      stopCurrentPlayback("clear");
+      stopTimer();
+
+      sessionTimerSec = 0;
+      sessionTimerEl.textContent = "00:00";
+
+      messages = [];
+      currentTurnId = null;
+      activeAssistantMessageId = null;
+      conversationMode = "chat";
+      storyAutoContinueCount = 0;
+      resetTranscriptTurnBuffer();
+
+      decideDebugEl.textContent = "{}";
+      streamDebugEl.textContent = "{}";
+
+      renderMessages();
+      setRecognitionState("idle");
+      updateStatus();
+    };
+
+    renderMessages();
+    setRecognitionState("idle");
+    updateStatus();
+  </script>
+</body>
+</html>
