@@ -192,14 +192,25 @@ def generate_agent_reply(history, user_input: str) -> str:
 
 
 def generate_agent_reply_stream(history, user_input: str, mode: str = "chat") -> Iterator[str]:
+    stream, _meta = generate_agent_reply_stream_with_meta(history, user_input, mode=mode)
+    yield from stream
+
+
+def generate_agent_reply_stream_with_meta(
+    history,
+    user_input: str,
+    mode: str = "chat",
+) -> tuple[Iterator[str], dict[str, Any]]:
     if mode == "storytelling":
         story_input = (
             f"{user_input}\n"
             "要求：直接进入讲述内容，不要先说“好的我开始讲”。"
             "请按自然段推进剧情，适合语音连续播报。"
         )
-        yield from stream_generate_reply(history, story_input, mode="storytelling")
-        return
+        return (
+            stream_generate_reply(history, story_input, mode="storytelling"),
+            {"source": "generated_stream", "reason": "storytelling_mode"},
+        )
 
     plan = plan_agent_action(history, user_input)
     print("agent_plan:", plan)
@@ -207,18 +218,33 @@ def generate_agent_reply_stream(history, user_input: str, mode: str = "chat") ->
     if plan.get("type") == "direct_answer":
         reply = (plan.get("reply") or "").strip()
         if reply:
-            yield reply
-            return
-        yield from stream_generate_reply(history, user_input, mode=mode)
-        return
+            print("[canonical reply selected]", {"source": "agent_plan.reply", "reply": reply})
+
+            def _canonical_stream() -> Iterator[str]:
+                yield reply
+
+            return (
+                _canonical_stream(),
+                {
+                    "source": "canonical_reply",
+                    "canonical_reply": reply,
+                    "plan": plan,
+                },
+            )
+        return (
+            stream_generate_reply(history, user_input, mode=mode),
+            {"source": "generated_stream", "reason": "empty_direct_reply", "plan": plan},
+        )
 
     tool_name = plan.get("tool_name", "")
     args = plan.get("args", {})
 
     tool = TOOLS.get(tool_name)
     if not tool:
-        yield from stream_generate_reply(history, user_input, mode=mode)
-        return
+        return (
+            stream_generate_reply(history, user_input, mode=mode),
+            {"source": "generated_stream", "reason": "tool_not_found", "plan": plan},
+        )
 
     try:
         if tool_name == "get_time":
@@ -226,8 +252,10 @@ def generate_agent_reply_stream(history, user_input: str, mode: str = "chat") ->
         elif tool_name == "get_weather_mock":
             tool_result = tool(city=str(args.get("city", "本地")))
         else:
-            yield from stream_generate_reply(history, user_input, mode=mode)
-            return
+            return (
+                stream_generate_reply(history, user_input, mode=mode),
+                {"source": "generated_stream", "reason": "tool_not_allowed", "plan": plan},
+            )
     except Exception as exc:  # noqa: BLE001
         tool_result = f"工具执行失败: {exc}"
 
@@ -240,4 +268,12 @@ def generate_agent_reply_stream(history, user_input: str, mode: str = "chat") ->
         f"工具结果：{tool_result}\n"
         "请用简短、自然、适合语音播报的中文回答用户。"
     )
-    yield from stream_generate_reply(history, augmented_input, mode=mode)
+    return (
+        stream_generate_reply(history, augmented_input, mode=mode),
+        {
+            "source": "generated_stream",
+            "reason": "tool_augmented_generation",
+            "plan": plan,
+            "tool_name": tool_name,
+        },
+    )

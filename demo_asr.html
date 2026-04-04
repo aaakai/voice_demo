@@ -417,19 +417,31 @@
 
     let currentStreamController = null;
     let currentTurnId = null;
+    let currentTurnActive = false;
     let activeAssistantMessageId = null;
     let conversationMode = "chat";
     let storyAutoContinueCount = 0;
     const STORY_AUTO_CONTINUE_MAX = 2;
+    const ENABLE_BACKCHANNEL = true;
 
-    // TTS queue
-    let speechQueue = [];
-    let isSpeakingChunk = false;
+    // TTS text buffer + PCM streaming playback
     let assistantSpeaking = false;
     let playbackStage = "idle";
-    let ttsBufferText = "";
+    let ttsTextBuffer = "";
     let ttsBufferTurnId = null;
     let ttsFlushTimer = null;
+    let lastTtsFlushText = "";
+    let pendingTtsRequestsCount = 0;
+    let pendingTtsControllers = [];
+    let lastAudioChunkSize = 0;
+
+    let audioCtx = null;
+    let pcmQueue = [];
+    let pcmQueueScheduling = false;
+    let pcmPlaying = false;
+    let pcmCurrentTurnId = null;
+    let pcmNextPlayTime = 0;
+    let activePcmSources = [];
 
     // Realtime connection state
     let shouldKeepListening = false;
@@ -463,11 +475,20 @@
     let lastTranscriptUpdateAt = 0;
     let activeUserTranscript = "";
     let assistantInterjectCooldownUntil = 0;
+    let partialTranscript = "";
+    let partialTurnConsumed = false;
+    let partialTurnTakeoverUsed = false;
+    let lastTakeoverAt = 0;
+    const ASSISTANT_INTERJECT_COOLDOWN_MS = 4000;
 
     // turn finalize guards
     let finalizeTurnTimer = null;
     let pendingFinalize = false;
     let finalizingUserTurn = false;
+    let currentInputTurnSeq = 0;
+    let finalizedInputTurnSeq = 0;
+    let appendedUserMessageTurnSeq = 0;
+    let streamTriggeredTurnSeq = 0;
 
     let sessionTimerSec = 0;
     let timerHandle = null;
@@ -512,9 +533,15 @@
           should_keep_listening: shouldKeepListening,
           assistant_speaking: assistantSpeaking,
           playback_stage: playbackStage,
-          tts_queue: speechQueue.length,
-          tts_playing: isSpeakingChunk,
-          tts_buffer_text: ttsBufferText,
+          current_tts_text_buffer: ttsTextBuffer,
+          pending_tts_requests_count: pendingTtsRequestsCount,
+          pcm_queue_length: pcmQueue.length,
+          current_audio_queue_length: pcmQueue.length,
+          pcm_playing: pcmPlaying,
+          current_pcm_playing: pcmPlaying,
+          pcm_current_turn_id: pcmCurrentTurnId,
+          last_tts_flush_text: lastTtsFlushText,
+          last_audio_chunk_size: lastAudioChunkSize,
           realtime_connected: !!rtcPc && rtcPc.connectionState === "connected",
           currentTranscript: currentTranscript,
           currentCompletedTranscript: currentCompletedTranscript,
@@ -522,18 +549,31 @@
           active_input_item_id: activeInputItemId,
           pending_finalize: pendingFinalize,
           finalizing_user_turn: finalizingUserTurn,
+          current_input_turn_seq: currentInputTurnSeq,
+          finalized_input_turn_seq: finalizedInputTurnSeq,
+          appended_user_turn_seq: appendedUserMessageTurnSeq,
+          stream_triggered_turn_seq: streamTriggeredTurnSeq,
           pending_interrupt: pendingInterrupt,
           recent_assistant_text: recentAssistantText,
           ignore_echo_until: ignoreEchoUntil,
           // NEW: backchannel debug state
           user_speaking: userSpeaking,
+          userSpeaking,
+          partialTranscript,
+          partialTurnConsumed,
+          partialTurnTakeoverUsed,
           last_speech_started_at: lastSpeechStartedAt,
           last_transcript_update_at: lastTranscriptUpdateAt,
           active_user_transcript: activeUserTranscript,
           assistant_interject_cooldown_until: assistantInterjectCooldownUntil,
+          lastTranscriptUpdateAt,
+          assistantInterjectCooldownUntil,
           rtc_connection_state: rtcConnectionState,
           rtc_data_channel_open: rtcDataChannelOpen,
           current_turn_id: currentTurnId,
+          current_turn_active: currentTurnActive,
+          current_assistant_text:
+            (messages.find((m) => m.id === activeAssistantMessageId) || {}).text || "",
           conversation_mode: conversationMode,
           story_auto_continue_count: storyAutoContinueCount,
         },
@@ -622,18 +662,93 @@
       timelineEl.scrollTop = timelineEl.scrollHeight;
     }
 
+    async function ensureAudioContext() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+      }
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume();
+      }
+      return audioCtx;
+    }
+
+    function concatUint8(a, b) {
+      if (!a || a.length === 0) return b;
+      if (!b || b.length === 0) return a;
+      const out = new Uint8Array(a.length + b.length);
+      out.set(a, 0);
+      out.set(b, a.length);
+      return out;
+    }
+
+    function pcmBytesToFloat32(pcmBytes) {
+      const sampleCount = Math.floor(pcmBytes.length / 2);
+      const view = new DataView(
+        pcmBytes.buffer,
+        pcmBytes.byteOffset,
+        sampleCount * 2
+      );
+      const out = new Float32Array(sampleCount);
+      for (let i = 0; i < sampleCount; i++) {
+        const s = view.getInt16(i * 2, true);
+        out[i] = Math.max(-1, Math.min(1, s / 32768));
+      }
+      return out;
+    }
+
+    function base64ToUint8Array(base64) {
+      const binary = atob(base64);
+      const len = binary.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    function clearPendingTtsRequests() {
+      for (const item of pendingTtsControllers) {
+        try { item.controller.abort(); } catch {}
+      }
+      pendingTtsControllers = [];
+      pendingTtsRequestsCount = 0;
+    }
+
+    function stopPcmPlayback() {
+      console.log("[PCM interrupted]");
+      for (const item of activePcmSources) {
+        try { item.source.stop(); } catch {}
+      }
+      activePcmSources = [];
+      pcmQueue = [];
+      pcmQueueScheduling = false;
+      pcmPlaying = false;
+      pcmCurrentTurnId = null;
+      pcmNextPlayTime = 0;
+    }
+
     function clearTTSQueue() {
       if (ttsFlushTimer) {
         clearTimeout(ttsFlushTimer);
         ttsFlushTimer = null;
       }
-      ttsBufferText = "";
+      ttsTextBuffer = "";
       ttsBufferTurnId = null;
-      speechQueue = [];
-      isSpeakingChunk = false;
-      window.speechSynthesis.cancel();
+      lastTtsFlushText = "";
+      clearPendingTtsRequests();
+      stopPcmPlayback();
       assistantSpeaking = false;
       playbackStage = "idle";
+      console.log("[Turn state reset]", {
+        reason: "clear_tts_queue",
+        pendingFinalize,
+        finalizingUserTurn,
+        assistantSpeaking,
+        pcmPlaying,
+        activeInputItemId,
+        currentTurnId,
+        audioCurrentTurnId: pcmCurrentTurnId,
+      });
       updateStatus();
     }
 
@@ -656,26 +771,154 @@
       recentAssistantText = (recentAssistantText + text).slice(-80);
     }
 
-    // NEW: backchannel engine
-    function maybeBackchannel() {
-      if (!userSpeaking) return;
-      if (assistantSpeaking) return;
-      if (Date.now() < assistantInterjectCooldownUntil) return;
+    function hasActiveAssistantTurn() {
+      return (
+        currentTurnActive ||
+        !!currentStreamController ||
+        assistantSpeaking ||
+        pcmPlaying
+      );
+    }
 
-      const text = (activeUserTranscript || "").trim();
-      if (text.length < 6) return;
+    function hasStrictAssistantActivity() {
+      return currentTurnActive || !!currentStreamController || assistantSpeaking || pcmPlaying;
+    }
 
-      const pause = Date.now() - lastTranscriptUpdateAt;
-      if (pause < 600 || pause > 1500) return;
+    function resetUserSpeechState(reason = "unknown") {
+      userSpeaking = false;
+      partialTranscript = "";
+      activeUserTranscript = "";
+      partialTurnConsumed = false;
+      partialTurnTakeoverUsed = false;
+      console.log("[Turn state reset]", {
+        reason,
+        userSpeaking,
+        partialTranscript,
+        partialTurnConsumed,
+        partialTurnTakeoverUsed,
+      });
+    }
 
+    function interruptCurrentTurn(reason = "manual") {
+      const interruptedTurnId = currentTurnId;
+      console.log("[interruptCurrentTurn]", {
+        reason,
+        interruptedTurnId,
+        has_stream: !!currentStreamController,
+        assistantSpeaking,
+        pcmPlaying,
+        pcmQueueLength: pcmQueue.length,
+      });
+
+      if (currentStreamController) {
+        currentStreamController.abort();
+        currentStreamController = null;
+      }
+
+      clearTTSQueue();
+      currentTurnActive = false;
+      currentTurnId = null;
+      resetUserSpeechState(`interrupt:${reason}`);
+
+      if (activeAssistantMessageId) {
+        updateMessage(activeAssistantMessageId, { status: "interrupted" });
+      }
+
+      streamDebugEl.textContent = JSON.stringify(
+        { phase: "interrupted", reason, interrupted_turn_id: interruptedTurnId },
+        null,
+        2
+      );
+      updateStatus();
+    }
+
+    function isNoisyPartial(text) {
+      const t = (text || "").trim();
+      if (!t) return true;
+      if (t.length <= 1) return true;
+      return /^(嗯|啊|哦|喂|欸|诶|哈|唉|呃)+$/.test(t);
+    }
+
+    function decideAssistantInterruption() {
+      const now = Date.now();
+      const text = (partialTranscript || "").trim();
+      const pauseMs = now - lastTranscriptUpdateAt;
+      const textLen = text.length;
+      const inCooldown = now < assistantInterjectCooldownUntil;
+
+      let action = "none";
+      if (
+        userSpeaking &&
+        !assistantSpeaking &&
+        !hasStrictAssistantActivity() &&
+        !partialTurnConsumed &&
+        !inCooldown &&
+        !isNoisyPartial(text) &&
+        textLen >= 6 &&
+        pauseMs >= 500 &&
+        pauseMs <= 1200
+      ) {
+        const canTakeover =
+          conversationMode === "storytelling"
+            ? textLen >= 22 && pauseMs >= 1000
+            : textLen >= 14 && pauseMs >= 800;
+        if (canTakeover) {
+          action = "takeover";
+        } else if (textLen >= 10) {
+          action = "backchannel";
+        }
+      }
+
+      console.log("[assistant interruption evaluate]", {
+        action,
+        userSpeaking,
+        assistantSpeaking,
+        hasActiveAssistantTurn: hasActiveAssistantTurn(),
+        partialTurnConsumed,
+        textLen,
+        pauseMs,
+        inCooldown,
+        conversationMode,
+      });
+      return action;
+    }
+
+    function triggerAssistantBackchannel() {
       const candidates = ["嗯", "好的", "明白", "我在听", "继续说"];
       const reply = candidates[Math.floor(Math.random() * candidates.length)];
-      enqueueTTS(reply, currentTurnId || "backchannel");
-      assistantInterjectCooldownUntil = Date.now() + 3000;
+      assistantInterjectCooldownUntil = Date.now() + ASSISTANT_INTERJECT_COOLDOWN_MS;
+      console.log("[assistant backchannel triggered]", { reply, partialTranscript });
+      enqueueTTS(reply, "backchannel");
+    }
 
-      console.log("[Backchannel triggered]", {
-        transcript: activeUserTranscript,
-        pause,
+    function startAssistantTakeover() {
+      const text = (partialTranscript || "").trim();
+      if (!text || partialTurnConsumed) return;
+      const turnSeqAtTakeover = currentInputTurnSeq;
+      partialTurnConsumed = true;
+      partialTurnTakeoverUsed = true;
+      userSpeaking = false;
+      clearFinalizeTurnTimer();
+      pendingFinalize = false;
+      finalizedInputTurnSeq = Math.max(finalizedInputTurnSeq, turnSeqAtTakeover);
+      appendedUserMessageTurnSeq = Math.max(appendedUserMessageTurnSeq, turnSeqAtTakeover);
+      streamTriggeredTurnSeq = Math.max(streamTriggeredTurnSeq, turnSeqAtTakeover);
+      assistantInterjectCooldownUntil = Date.now() + ASSISTANT_INTERJECT_COOLDOWN_MS;
+      lastTakeoverAt = Date.now();
+
+      console.log("[assistant takeover triggered]", {
+        text,
+        currentInputTurnSeq,
+        turnSeqAtTakeover,
+      });
+
+      appendMessage("user", text, { status: "done" });
+      streamReply(text, { mode: conversationMode }).catch((err) => {
+        streamDebugEl.textContent = JSON.stringify(
+          { phase: "assistant_takeover_stream_error", error: err.message },
+          null,
+          2
+        );
       });
     }
 
@@ -701,50 +944,207 @@
     }
 
     function stopCurrentPlayback(reason = "manual") {
-      if (currentStreamController) {
-        currentStreamController.abort();
-        currentStreamController = null;
-      }
-      clearTTSQueue();
+      interruptCurrentTurn(reason);
+    }
 
-      if (activeAssistantMessageId) {
-        updateMessage(activeAssistantMessageId, { status: "interrupted" });
-      }
+    async function pumpPcmPlaybackQueue() {
+      if (pcmQueueScheduling) return;
+      pcmQueueScheduling = true;
+      try {
+        const ctx = await ensureAudioContext();
+        while (pcmQueue.length > 0) {
+          const item = pcmQueue.shift();
+          if (!item) continue;
 
-      streamDebugEl.textContent = JSON.stringify(
-        { phase: "stopped", reason, turn_id: currentTurnId },
-        null,
-        2
-      );
+          const validTurn =
+            item.turnId === "backchannel" || item.turnId === currentTurnId;
+          if (!validTurn) {
+            continue;
+          }
+
+          const buffer = ctx.createBuffer(1, item.samples.length, 24000);
+          buffer.copyToChannel(item.samples, 0, 0);
+
+          const source = ctx.createBufferSource();
+          source.buffer = buffer;
+          source.connect(ctx.destination);
+
+          const now = ctx.currentTime;
+          if (pcmNextPlayTime < now + 0.01) {
+            pcmNextPlayTime = now + 0.01;
+          }
+          const startAt = pcmNextPlayTime;
+          pcmNextPlayTime += buffer.duration;
+
+          console.log("[PCM playback start]", {
+            turn_id: item.turnId,
+            duration: buffer.duration,
+            start_at: startAt,
+          });
+          console.log("[pcm playback start]", {
+            turn_id: item.turnId,
+            duration: buffer.duration,
+            start_at: startAt,
+          });
+
+          source.start(startAt);
+          const ref = { source, turnId: item.turnId };
+          activePcmSources.push(ref);
+          pcmPlaying = true;
+          assistantSpeaking = true;
+          playbackStage = "tts_streaming";
+          pcmCurrentTurnId = item.turnId;
+          updateStatus();
+
+          source.onended = () => {
+            const idx = activePcmSources.indexOf(ref);
+            if (idx >= 0) activePcmSources.splice(idx, 1);
+            console.log("[PCM playback end]", {
+              turnId: item.turnId,
+              remaining_active: activePcmSources.length,
+              remainingQueue: pcmQueue.length,
+              pcmPlaying,
+            });
+            if (activePcmSources.length === 0 && pcmQueue.length === 0) {
+              pcmPlaying = false;
+              assistantSpeaking = false;
+              playbackStage = "idle";
+              pcmCurrentTurnId = null;
+              if (activeAssistantMessageId) {
+                const target = messages.find((m) => m.id === activeAssistantMessageId);
+                if (target && target.status !== "interrupted") {
+                  updateMessage(activeAssistantMessageId, { status: "done" });
+                }
+              }
+            }
+            updateStatus();
+          };
+        }
+      } finally {
+        pcmQueueScheduling = false;
+      }
+    }
+
+    function enqueuePcmSamples(samples, turnId) {
+      const validTurn = turnId === "backchannel" || turnId === currentTurnId;
+      if (!validTurn || !samples || samples.length === 0) return;
+      pcmQueue.push({ samples, turnId });
+      console.log("[PCM enqueue]", {
+        turn_id: turnId,
+        samples: samples.length,
+        queue_length: pcmQueue.length,
+      });
+      console.log("[pcm enqueue]", {
+        turn_id: turnId,
+        samples: samples.length,
+        queue_length: pcmQueue.length,
+      });
+      pumpPcmPlaybackQueue().catch((err) => {
+        console.log("[PCM playback error]", err);
+      });
+      updateStatus();
+    }
+
+    async function streamTTSByProxy(text, turnId) {
+      const normalizedTurnId = turnId || currentTurnId || "backchannel";
+      const validTurn = normalizedTurnId === "backchannel" || normalizedTurnId === currentTurnId;
+      if (!validTurn) return;
+
+      const controller = new AbortController();
+      pendingTtsControllers.push({ controller, turnId: normalizedTurnId });
+      pendingTtsRequestsCount += 1;
+      updateStatus();
+
+      try {
+        console.log("[TTS stream start]", { text, turn_id: normalizedTurnId });
+        const resp = await fetch(`${API_BASE}/tts_proxy`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+          signal: controller.signal,
+        });
+        if (!resp.ok || !resp.body) {
+          const errText = await resp.text();
+          throw new Error(`/tts_proxy failed: ${resp.status} ${errText}`);
+        }
+
+        const reader = resp.body.getReader();
+        let pcmByteBuffer = new Uint8Array(0);
+        const MIN_PCM_BYTES = 4096; // 2048 samples @ 24k mono
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!value || value.length === 0) continue;
+          console.log("[TTS pcm chunk]", value.length);
+
+          if (
+            normalizedTurnId !== "backchannel" &&
+            normalizedTurnId !== currentTurnId
+          ) {
+            break;
+          }
+
+          pcmByteBuffer = concatUint8(pcmByteBuffer, value);
+          while (pcmByteBuffer.length >= MIN_PCM_BYTES) {
+            const usableBytes = MIN_PCM_BYTES - (MIN_PCM_BYTES % 2);
+            const pcmPart = pcmByteBuffer.slice(0, usableBytes);
+            pcmByteBuffer = pcmByteBuffer.slice(usableBytes);
+            const samples = pcmBytesToFloat32(pcmPart);
+            enqueuePcmSamples(samples, normalizedTurnId);
+          }
+        }
+
+        if (pcmByteBuffer.length >= 2) {
+          const usableBytes = pcmByteBuffer.length - (pcmByteBuffer.length % 2);
+          const pcmPart = pcmByteBuffer.slice(0, usableBytes);
+          const samples = pcmBytesToFloat32(pcmPart);
+          enqueuePcmSamples(samples, normalizedTurnId);
+        }
+      } catch (err) {
+        if (err.name === "AbortError") {
+          console.log("[PCM interrupted]");
+        } else {
+          console.log("[TTS stream error]", err);
+        }
+      } finally {
+        pendingTtsControllers = pendingTtsControllers.filter((x) => x.controller !== controller);
+        pendingTtsRequestsCount = Math.max(0, pendingTtsRequestsCount - 1);
+        updateStatus();
+      }
     }
 
     function flushTTSBuffer() {
-      if (!ttsBufferText.trim()) return;
-      speechQueue.push({ text: ttsBufferText.trim(), turnId: ttsBufferTurnId });
-      ttsBufferText = "";
+      const text = (ttsTextBuffer || "").trim();
+      if (!text) return;
+      const turnId = ttsBufferTurnId || currentTurnId || "backchannel";
+      lastTtsFlushText = text;
+      console.log("[TTS text flush]", { turn_id: turnId, text });
+      ttsTextBuffer = "";
       ttsBufferTurnId = null;
-      playNextTTSChunk();
+      streamTTSByProxy(text, turnId).catch((err) => {
+        console.log("[TTS proxy error]", err);
+      });
       updateStatus();
     }
 
     function enqueueTTS(text, turnId) {
       if (!text || !text.trim()) return;
+      const normalizedTurnId = turnId || currentTurnId || "backchannel";
 
-      const normalizedTurnId = turnId || "backchannel";
       if (ttsBufferTurnId && ttsBufferTurnId !== normalizedTurnId) {
         flushTTSBuffer();
       }
-
       ttsBufferTurnId = normalizedTurnId;
-      ttsBufferText += text;
+      ttsTextBuffer += text;
 
-      const trimmed = ttsBufferText.trim();
+      const trimmed = ttsTextBuffer.trim();
       const endsStrong = /[。！？!?\n]$/.test(trimmed);
       const endsWeak = /[，、,；;]$/.test(trimmed);
       const shouldFlushNow =
         endsStrong ||
         (endsWeak && trimmed.length >= 14) ||
-        trimmed.length >= 30;
+        trimmed.length >= 24;
 
       if (ttsFlushTimer) {
         clearTimeout(ttsFlushTimer);
@@ -759,81 +1159,20 @@
           flushTTSBuffer();
         }, 320);
       }
-
       updateStatus();
-    }
-
-    function playNextTTSChunk() {
-      if (isSpeakingChunk) return;
-      if (!speechQueue.length) return;
-
-      const next = speechQueue.shift();
-      const validTurn = next && (next.turnId === currentTurnId || next.turnId === "backchannel");
-      if (!next || !next.text || !validTurn) {
-        playNextTTSChunk();
-        return;
-      }
-
-      const utterance = new SpeechSynthesisUtterance(next.text);
-      utterance.lang = "zh-CN";
-      utterance.rate = 1.0;
-      utterance.pitch = 1.0;
-      utterance.volume = 1.0;
-
-      const wasSpeaking = assistantSpeaking;
-      isSpeakingChunk = true;
-      assistantSpeaking = true;
-      playbackStage = "tts_streaming";
-      if (!wasSpeaking) {
-        ignoreEchoUntil = Date.now() + 1200;
-      }
-      console.log("[TTS speak]", next.text);
-      if (activeAssistantMessageId) {
-        updateMessage(activeAssistantMessageId, { status: "speaking" });
-      }
-      updateStatus();
-
-      utterance.onend = () => {
-        isSpeakingChunk = false;
-        if (speechQueue.length > 0) {
-          playNextTTSChunk();
-          return;
-        }
-        assistantSpeaking = false;
-        playbackStage = "idle";
-        if (activeAssistantMessageId) {
-          const target = messages.find((m) => m.id === activeAssistantMessageId);
-          if (target && target.status !== "interrupted") {
-            updateMessage(activeAssistantMessageId, { status: "done" });
-          }
-        }
-        updateStatus();
-      };
-
-      utterance.onerror = () => {
-        isSpeakingChunk = false;
-        assistantSpeaking = false;
-        playbackStage = "idle";
-        if (activeAssistantMessageId) {
-          updateMessage(activeAssistantMessageId, { status: "interrupted" });
-        }
-        updateStatus();
-      };
-
-      window.speechSynthesis.speak(utterance);
     }
 
     async function streamReply(userText, opts = {}) {
       const mode = opts.mode || conversationMode || "chat";
       const isAutoContinue = !!opts.isAutoContinue;
 
-      if (currentStreamController) {
-        currentStreamController.abort();
+      if (hasActiveAssistantTurn()) {
+        interruptCurrentTurn("new_stream_start");
       }
 
       currentStreamController = new AbortController();
 
-      const resp = await fetch(`${API_BASE}/stream_reply`, {
+      const resp = await fetch(`${API_BASE}/stream_reply_audio`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, user_text: userText, mode }),
@@ -842,10 +1181,10 @@
 
       if (!resp.ok) {
         const txt = await resp.text();
-        throw new Error(`/stream_reply failed: ${resp.status} ${txt}`);
+        throw new Error(`/stream_reply_audio failed: ${resp.status} ${txt}`);
       }
       if (!resp.body) {
-        throw new Error("No response body from /stream_reply");
+        throw new Error("No response body from /stream_reply_audio");
       }
 
       const reader = resp.body.getReader();
@@ -875,8 +1214,10 @@
             }
 
             if (chunk.type === "start") {
+              console.log("[audio stream start]", chunk);
               myTurnId = chunk.turn_id;
               currentTurnId = myTurnId;
+              currentTurnActive = true;
               fullReply = "";
               localAssistantMsgId = appendMessage("assistant", "", {
                 status: "streaming",
@@ -888,29 +1229,71 @@
             }
 
             if (myTurnId && chunk.turn_id && chunk.turn_id !== currentTurnId) {
+              const discardKind =
+                chunk.type === "audio_chunk"
+                  ? "audio"
+                  : chunk.type === "text_chunk"
+                    ? "text"
+                    : "event";
+              if (discardKind === "audio") {
+                console.log("[audio turn discarded]", {
+                  currentTurnId,
+                  chunkTurnId: chunk.turn_id,
+                  type: chunk.type,
+                });
+              } else if (discardKind === "text") {
+                console.log("[text turn discarded]", {
+                  currentTurnId,
+                  chunkTurnId: chunk.turn_id,
+                  type: chunk.type,
+                });
+              }
+              console.log("[turn discarded]", {
+                currentTurnId,
+                chunkTurnId: chunk.turn_id,
+                type: chunk.type,
+                kind: discardKind,
+              });
               continue;
             }
             if (!localAssistantMsgId) continue;
 
-            if (chunk.type === "chunk") {
+            if (chunk.type === "text_chunk") {
+              console.log("[text_chunk received]", {
+                turn_id: myTurnId,
+                text: chunk.text || "",
+              });
               fullReply += chunk.text || "";
               pushRecentAssistantText(chunk.text || "");
               updateMessage(localAssistantMsgId, {
                 text: fullReply,
                 status: assistantSpeaking ? "speaking" : "streaming"
               });
-              enqueueTTS(chunk.text || "", myTurnId);
 
               streamDebugEl.textContent = JSON.stringify(
                 { phase: "streaming", turn_id: myTurnId, response_text: fullReply },
                 null,
                 2
               );
+              continue;
+            }
+
+            if (chunk.type === "audio_chunk") {
+              if (!chunk.pcm_base64) continue;
+              const pcmBytes = base64ToUint8Array(chunk.pcm_base64);
+              lastAudioChunkSize = pcmBytes.length;
+              console.log("[audio_chunk received]", {
+                turn_id: myTurnId,
+                bytes: pcmBytes.length,
+              });
+              const samples = pcmBytesToFloat32(pcmBytes);
+              enqueuePcmSamples(samples, myTurnId);
+              updateMessage(localAssistantMsgId, { status: "speaking" });
+              continue;
             }
 
             if (chunk.type === "cancelled") {
-              clearTTSQueue();
-              updateMessage(localAssistantMsgId, { status: "interrupted" });
+              interruptCurrentTurn("server_cancelled");
               streamDebugEl.textContent = JSON.stringify(
                 { phase: "cancelled", turn_id: chunk.turn_id, response_text: fullReply },
                 null,
@@ -924,7 +1307,12 @@
 
               updateMessage(localAssistantMsgId, {
                 text: chunk.full_text || fullReply,
-                status: isSpeakingChunk || speechQueue.length > 0 ? "speaking" : "done"
+                status:
+                  pcmPlaying ||
+                  pendingTtsRequestsCount > 0 ||
+                  !!ttsTextBuffer.trim()
+                    ? "speaking"
+                    : "done"
               });
 
               streamDebugEl.textContent = JSON.stringify(
@@ -934,6 +1322,7 @@
               );
 
               const doneText = (chunk.full_text || fullReply || "").trim();
+              currentTurnActive = false;
               if (
                 mode === "storytelling" &&
                 isStoryOpeningOnly(doneText) &&
@@ -959,10 +1348,7 @@
         }
       } catch (err) {
         if (err.name === "AbortError") {
-          clearTTSQueue();
-          if (localAssistantMsgId) {
-            updateMessage(localAssistantMsgId, { status: "interrupted" });
-          }
+          interruptCurrentTurn("stream_abort");
           streamDebugEl.textContent = JSON.stringify(
             { phase: "aborted", turn_id: currentTurnId },
             null,
@@ -992,11 +1378,17 @@
 
     function scheduleFinalizeUserTurn(delay = 250) {
       if (finalizingUserTurn) return;
+      if (currentInputTurnSeq > 0 && finalizedInputTurnSeq >= currentInputTurnSeq) return;
       clearFinalizeTurnTimer();
       pendingFinalize = true;
+      console.log("[Finalize candidate]", {
+        reason: "speech_stopped",
+        delay,
+        turn_seq: currentInputTurnSeq,
+      });
       finalizeTurnTimer = setTimeout(() => {
         finalizeTurnTimer = null;
-        finalizeUserTurn().catch((err) => {
+        finalizeUserTurn("speech_stopped_timer").catch((err) => {
           streamDebugEl.textContent = JSON.stringify(
             { phase: "finalize_error", error: err.message },
             null,
@@ -1017,13 +1409,45 @@
       }, delayMs);
     }
 
+    function ensureInputTurnFromEvent(itemId, source) {
+      if (!itemId) return;
+      if (itemId === activeInputItemId) return;
+      currentInputTurnSeq += 1;
+      clearFinalizeTurnTimer();
+      pendingFinalize = false;
+      finalizingUserTurn = false;
+      activeInputItemId = itemId;
+      currentTranscript = "";
+      currentCompletedTranscript = "";
+      resetUserSpeechState(`ensure_input_turn:${source}`);
+      console.log("[Turn state reset]", {
+        reason: source,
+        pendingFinalize,
+        finalizingUserTurn,
+        assistantSpeaking,
+        pcmPlaying,
+        activeInputItemId,
+        currentTurnId,
+        audioCurrentTurnId: pcmCurrentTurnId,
+      });
+    }
+
     function resetTranscriptTurnBuffer() {
       currentTranscript = "";
       currentCompletedTranscript = "";
       activeInputItemId = null;
-      // NEW: backchannel transcript lifecycle
-      activeUserTranscript = "";
+      resetUserSpeechState("reset_transcript_turn_buffer");
       setLiveTranscript("");
+      console.log("[Turn state reset]", {
+        reason: "reset_transcript_turn_buffer",
+        pendingFinalize,
+        finalizingUserTurn,
+        assistantSpeaking,
+        pcmPlaying,
+        activeInputItemId,
+        currentTurnId,
+        audioCurrentTurnId: pcmCurrentTurnId,
+      });
     }
 
     async function getRealtimeSession() {
@@ -1089,6 +1513,27 @@
       };
       rtcDc.onclose = () => {
         console.log("[Realtime dc close]");
+        if (
+          !finalizingUserTurn &&
+          currentInputTurnSeq > 0 &&
+          finalizedInputTurnSeq < currentInputTurnSeq &&
+          appendedUserMessageTurnSeq < currentInputTurnSeq &&
+          streamTriggeredTurnSeq < currentInputTurnSeq &&
+          (currentCompletedTranscript || "").trim()
+        ) {
+          console.log("[DC close fallback finalize]", {
+            turn_seq: currentInputTurnSeq,
+            completed: currentCompletedTranscript,
+          });
+          finalizeUserTurn("dc_close_fallback").catch((err) => {
+            streamDebugEl.textContent = JSON.stringify(
+              { phase: "dc_close_finalize_error", error: err.message },
+              null,
+              2
+            );
+          });
+        }
+        resetUserSpeechState("rtc_dc_close");
         if (shouldKeepListening) scheduleRealtimeRestart(800);
       };
       rtcDc.onerror = (err) => {
@@ -1142,6 +1587,7 @@
         for (const t of micStream.getTracks()) t.stop();
       }
       micStream = null;
+      resetUserSpeechState("close_realtime_connection");
 
       recognitionRunning = false;
       recognitionStarting = false;
@@ -1177,18 +1623,40 @@
       setRecognitionState("idle");
     }
 
-    async function finalizeUserTurn() {
+    async function finalizeUserTurn(triggerReason = "normal") {
       if (finalizingUserTurn) return;
+      if (currentInputTurnSeq > 0 && finalizedInputTurnSeq >= currentInputTurnSeq) return;
+      if (partialTurnConsumed) {
+        console.log("[Finalize skipped]", {
+          reason: "partial_turn_consumed",
+          triggerReason,
+          currentInputTurnSeq,
+        });
+        resetTranscriptTurnBuffer();
+        return;
+      }
       finalizingUserTurn = true;
 
       clearFinalizeTurnTimer();
       pendingFinalize = false;
       pendingInterrupt = false;
       interruptCandidateTranscript = "";
+      const turnSeqAtStart = currentInputTurnSeq;
 
       try {
         const completedText = (currentCompletedTranscript || "").trim();
         const fallbackText = (currentTranscript || activeUserTranscript || "").trim();
+        console.log("[Finalize candidate]", {
+          transcript: currentTranscript,
+          completed: currentCompletedTranscript,
+          pendingFinalize,
+          finalizingUserTurn,
+          assistantSpeaking,
+          pcmPlaying,
+          audioQueueLength: pcmQueue.length,
+          currentTurnId,
+          activeInputItemId,
+        });
         let finalizeSource = "none";
         let finalText = "";
         if (completedText) {
@@ -1199,12 +1667,21 @@
           finalText = fallbackText;
         }
         lastFinalizeSource = finalizeSource;
+        console.log("[Finalize candidate]", {
+          reason: triggerReason,
+          turn_seq: turnSeqAtStart,
+          completed_len: completedText.length,
+          fallback_len: fallbackText.length,
+        });
         console.log("[Finalize source]", {
           source: finalizeSource,
+          reason: triggerReason,
+          turn_seq: turnSeqAtStart,
           completed: completedText,
           fallback: fallbackText,
         });
 
+        finalizedInputTurnSeq = Math.max(finalizedInputTurnSeq, turnSeqAtStart);
         resetTranscriptTurnBuffer();
         if (!finalText) return;
         if (finalText.length <= 6 && isLikelyEcho(finalText)) {
@@ -1223,8 +1700,19 @@
         }
         storyAutoContinueCount = 0;
 
+        if (appendedUserMessageTurnSeq >= turnSeqAtStart) return;
+        appendedUserMessageTurnSeq = turnSeqAtStart;
         appendMessage("user", finalText, { status: "done" });
 
+        if (streamTriggeredTurnSeq >= turnSeqAtStart) return;
+        streamTriggeredTurnSeq = turnSeqAtStart;
+        console.log("[Trigger stream_reply]", {
+          turn_seq: turnSeqAtStart,
+          turnSeq: turnSeqAtStart,
+          mode: conversationMode,
+          text: finalText,
+          currentTurnId,
+        });
         streamReply(finalText, { mode: conversationMode }).catch((err) => {
           streamDebugEl.textContent = JSON.stringify(
             { phase: "stream_reply_error", error: err.message },
@@ -1250,28 +1738,36 @@
 
       // speech_started: earliest interrupt point
       if (evt.type === "input_audio_buffer.speech_started") {
+        console.log("[user speech started]", {
+          item_id: evt.item_id,
+          currentTurnId,
+          assistantSpeaking,
+          pcmPlaying,
+        });
         // 新一轮语音开始，取消上一轮挂起 finalize
         clearFinalizeTurnTimer();
         pendingFinalize = false;
 
-        activeInputItemId = evt.item_id || activeInputItemId;
+        if (hasActiveAssistantTurn()) {
+          console.log("[user interrupt detected]", {
+            reason: "speech_started_while_assistant_active",
+            currentTurnId,
+          });
+          interruptCurrentTurn("user_interrupt");
+        }
+        ensureInputTurnFromEvent(evt.item_id, "speech_started");
         currentTranscript = "";
         currentCompletedTranscript = "";
+        partialTranscript = "";
         setLiveTranscript("");
         // NEW: user speech turn state
         userSpeaking = true;
         lastSpeechStartedAt = Date.now();
         activeUserTranscript = "";
-
-        const speakingNow = assistantSpeaking || isSpeakingChunk || speechQueue.length > 0;
-        if (speakingNow) {
-          pendingInterrupt = true;
-          pendingInterruptStartedAt = Date.now();
-          interruptCandidateTranscript = "";
-        } else {
-          pendingInterrupt = false;
-          interruptCandidateTranscript = "";
-        }
+        partialTurnConsumed = false;
+        partialTurnTakeoverUsed = false;
+        pendingInterrupt = false;
+        interruptCandidateTranscript = "";
 
         streamDebugEl.textContent = JSON.stringify(
           { phase: "realtime_speech_started", event: evt },
@@ -1287,40 +1783,32 @@
         evt.type === "conversation.item.input_audio_transcription.delta" ||
         evt.type === "input_audio_transcription.delta"
       ) {
-        if (evt.item_id) activeInputItemId = evt.item_id;
+        ensureInputTurnFromEvent(evt.item_id, "delta_new_item");
         const delta = evt.delta || "";
         if (delta) {
           currentTranscript += delta;
+          partialTranscript = currentTranscript.trim();
           // NEW: accumulate backchannel transcript
           activeUserTranscript += delta;
           lastTranscriptUpdateAt = Date.now();
           setLiveTranscript(currentTranscript);
+          console.log("[partial transcript updated]", {
+            partialTranscript,
+            length: partialTranscript.length,
+          });
+          console.log("[Realtime transcript state]", {
+            transcript: currentTranscript,
+            completed: currentCompletedTranscript,
+            activeInputItemId,
+            currentTurnId
+          });
 
-          if (pendingInterrupt) {
-            interruptCandidateTranscript = currentTranscript.trim();
-            const elapsed = Date.now() - pendingInterruptStartedAt;
-            const thresholdHit = elapsed >= 400 || interruptCandidateTranscript.length >= 3;
-            if (thresholdHit) {
-              const inEchoWindow = Date.now() <= ignoreEchoUntil;
-              const likelyEcho = isLikelyEcho(interruptCandidateTranscript);
-              if (likelyEcho && inEchoWindow) {
-                pendingInterrupt = false;
-                interruptCandidateTranscript = "";
-                streamDebugEl.textContent = JSON.stringify(
-                  { phase: "echo_ignored_interrupt", transcript: currentTranscript },
-                  null,
-                  2
-                );
-              } else {
-                pendingInterrupt = false;
-                interruptCandidateTranscript = "";
-                stopCurrentPlayback("confirmed_user_interrupt");
-              }
-            }
+          const assistantAction = decideAssistantInterruption();
+          if (assistantAction === "backchannel") {
+            triggerAssistantBackchannel();
+          } else if (assistantAction === "takeover") {
+            startAssistantTakeover();
           }
-
-          // NEW: try short assistant interjection while user still speaking
-          maybeBackchannel();
         }
         return;
       }
@@ -1330,24 +1818,65 @@
         evt.type === "conversation.item.input_audio_transcription.completed" ||
         evt.type === "input_audio_transcription.completed"
       ) {
+        ensureInputTurnFromEvent(evt.item_id, "completed_new_item");
         const transcript = (evt.transcript || "").trim();
+        console.log("[Completed transcript received]", {
+          transcript,
+          turn_seq: currentInputTurnSeq,
+          pending_finalize: pendingFinalize,
+          finalizing_user_turn: finalizingUserTurn,
+        });
         if (transcript) {
           currentCompletedTranscript = transcript;
+          partialTranscript = transcript;
           // NEW: keep user-side active transcript up-to-date
           activeUserTranscript = transcript;
           setLiveTranscript(transcript);
         }
+        console.log("[Realtime transcript state]", {
+          transcript: currentTranscript,
+          completed: currentCompletedTranscript,
+          activeInputItemId,
+          currentTurnId
+        });
 
         // 若已收到 speech_stopped，completed 到达后立即 finalize
         if (pendingFinalize) {
           clearFinalizeTurnTimer();
-          finalizeUserTurn().catch((err) => {
+          console.log("[Finalize candidate]", {
+            reason: "completed_with_pending_finalize",
+            turn_seq: currentInputTurnSeq,
+          });
+          finalizeUserTurn("completed_with_pending_finalize").catch((err) => {
             streamDebugEl.textContent = JSON.stringify(
               { phase: "finalize_error", error: err.message },
               null,
               2
             );
           });
+        } else if (
+          transcript &&
+          !finalizingUserTurn &&
+          currentInputTurnSeq > finalizedInputTurnSeq &&
+          streamTriggeredTurnSeq < currentInputTurnSeq
+        ) {
+          clearFinalizeTurnTimer();
+          pendingFinalize = true;
+          console.log("[Finalize candidate]", {
+            reason: "completed_fallback_timer",
+            delay: 200,
+            turn_seq: currentInputTurnSeq,
+          });
+          finalizeTurnTimer = setTimeout(() => {
+            finalizeTurnTimer = null;
+            finalizeUserTurn("completed_fallback_timer").catch((err) => {
+              streamDebugEl.textContent = JSON.stringify(
+                { phase: "finalize_error", error: err.message },
+                null,
+                2
+              );
+            });
+          }, 200);
         }
         return;
       }
@@ -1356,7 +1885,9 @@
       if (evt.type === "input_audio_buffer.speech_stopped") {
         // NEW: user speech turn state
         userSpeaking = false;
-        scheduleFinalizeUserTurn(250);
+        if (!partialTurnConsumed) {
+          scheduleFinalizeUserTurn(250);
+        }
         updateStatus();
       }
     }
@@ -1374,6 +1905,7 @@
       pendingFinalize = false;
       storyAutoContinueCount = 0;
       stopCurrentPlayback("manual_stop");
+      resetUserSpeechState("stop_btn");
       stopTimer();
       setRecognitionState("idle");
       updateStatus();
@@ -1385,6 +1917,7 @@
       clearFinalizeTurnTimer();
       pendingFinalize = false;
       stopCurrentPlayback("clear");
+      resetUserSpeechState("clear_btn");
       stopTimer();
 
       sessionTimerSec = 0;
