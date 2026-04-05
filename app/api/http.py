@@ -7,10 +7,12 @@ import base64
 import json
 import os
 import requests
+import re
 
 from app.interrupt.classifier import InterruptRequest, classify_interrupt
 from app.memory.session_state import SessionState
 from app.services.agent_service import generate_agent_reply_stream_with_meta
+from app.services.llm_service import generate_raw, generate_raw_openrouter
 from app.services.streaming_service import split_stream_for_tts
 
 app = FastAPI()
@@ -51,6 +53,16 @@ class RealtimeSessionRequest(BaseModel):
 
 class TTSProxyRequest(BaseModel):
     text: str
+
+
+class InterruptDecideRequest(BaseModel):
+    mode: str = "chat"
+    partial_text: str
+    pause_ms: int
+    user_speaking: bool
+    assistant_speaking: bool
+    cooldown_active: bool
+    recent_history: list[dict] = []
 
 
 @app.get("/health")
@@ -224,6 +236,167 @@ def _open_tts_stream(text: str):
         stream=True,
         timeout=(10, 300),
     )
+
+
+def _is_noisy_partial(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True
+    if len(t) <= 1:
+        return True
+    return bool(re.fullmatch(r"(嗯|啊|哦|喂|欸|诶|哈|唉|呃)+", t))
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _parse_interrupt_decision(raw_text: str) -> dict | None:
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
+        return None
+    try:
+        parsed = json.loads(raw_text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    candidate = _extract_first_json_object(raw_text)
+    if not candidate:
+        return None
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _build_interrupt_decider_prompt(req: InterruptDecideRequest) -> str:
+    hist = req.recent_history[-4:] if req.recent_history else []
+    hist_lines = []
+    for item in hist:
+        role = str(item.get("role", "unknown"))
+        text = str(item.get("text", ""))
+        hist_lines.append(f"{role}: {text}")
+    hist_text = "\n".join(hist_lines) if hist_lines else "(empty)"
+
+    return (
+        "你是实时语音助手的“主动插话决策器”，不是聊天助手。\n"
+        "你只能输出一个 JSON 对象，不要输出任何额外文本。\n"
+        '输出格式固定：{"action":"none|backchannel|takeover","reason":"...","reply_text":"..."}\n'
+        "规则：\n"
+        "1) 默认用户优先，除非信息已很清晰且出现停顿。\n"
+        "2) 用户明显还没说完，action=none。\n"
+        "3) 用户在停顿但还在表达，action=backchannel。\n"
+        "4) 信息清晰且停顿明显，action=takeover。\n"
+        "5) storytelling 模式下减少 takeover。\n"
+        "6) action=none 时 reply_text 必须为空字符串。\n"
+        "7) backchannel 的 reply_text 要短（1~6字），如“嗯/好的/明白/我在听”。\n"
+        "8) takeover 的 reply_text 可为简短接管提示语。\n"
+        "\n"
+        f"mode: {req.mode}\n"
+        f"user_speaking: {req.user_speaking}\n"
+        f"assistant_speaking: {req.assistant_speaking}\n"
+        f"cooldown_active: {req.cooldown_active}\n"
+        f"pause_ms: {req.pause_ms}\n"
+        f"partial_text: {req.partial_text}\n"
+        f"recent_history:\n{hist_text}\n"
+    )
+
+
+@app.post("/interrupt_decide")
+def interrupt_decide(req: InterruptDecideRequest) -> dict:
+    print(
+        "[interrupt_decide request]",
+        {
+            "mode": req.mode,
+            "partial_len": len((req.partial_text or "").strip()),
+            "pause_ms": req.pause_ms,
+            "user_speaking": req.user_speaking,
+            "assistant_speaking": req.assistant_speaking,
+            "cooldown_active": req.cooldown_active,
+        },
+    )
+
+    partial_text = (req.partial_text or "").strip()
+    if (
+        len(partial_text) < 6
+        or req.assistant_speaking
+        or req.cooldown_active
+        or req.pause_ms < 400
+        or req.pause_ms > 1500
+        or _is_noisy_partial(partial_text)
+    ):
+        print(
+            "[interrupt_decide gated_by_rule]",
+            {
+                "partial_len": len(partial_text),
+                "pause_ms": req.pause_ms,
+                "assistant_speaking": req.assistant_speaking,
+                "cooldown_active": req.cooldown_active,
+                "noisy": _is_noisy_partial(partial_text),
+            },
+        )
+        return {"action": "none", "reason": "gated_by_rule", "reply_text": ""}
+
+    prompt = _build_interrupt_decider_prompt(req)
+    print("[interrupt_decide llm start]")
+
+    raw = ""
+    try:
+        raw = generate_raw_openrouter(prompt)
+    except Exception as exc:  # noqa: BLE001
+        print("[interrupt_decide openrouter_error]", exc)
+        try:
+            raw = generate_raw(prompt)
+        except Exception as exc2:  # noqa: BLE001
+            print("[interrupt_decide llm error]", exc2)
+            return {"action": "none", "reason": "llm_error", "reply_text": ""}
+
+    parsed = _parse_interrupt_decision(raw)
+    if not parsed:
+        print("[interrupt_decide parse error]", {"raw": raw})
+        return {"action": "none", "reason": "parse_error", "reply_text": ""}
+
+    action = str(parsed.get("action", "none")).strip().lower()
+    reason = str(parsed.get("reason", "")).strip() or "llm_decision"
+    reply_text = str(parsed.get("reply_text", "")).strip()
+    if action not in {"none", "backchannel", "takeover"}:
+        action = "none"
+        reason = "invalid_action"
+        reply_text = ""
+    if action == "none":
+        reply_text = ""
+
+    result = {"action": action, "reason": reason, "reply_text": reply_text}
+    print("[interrupt_decide llm result]", result)
+    return result
 
 
 def stream_generated_reply_audio(

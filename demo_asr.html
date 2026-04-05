@@ -480,6 +480,11 @@
     let partialTurnTakeoverUsed = false;
     let lastTakeoverAt = 0;
     const ASSISTANT_INTERJECT_COOLDOWN_MS = 4000;
+    let pauseMs = 0;
+    let lastInterruptDecision = { action: "none", reason: "init", reply_text: "" };
+    let interruptDecideInFlight = false;
+    let lastInterruptDecideAt = 0;
+    const INTERRUPT_DECIDE_MIN_INTERVAL_MS = 260;
 
     // turn finalize guards
     let finalizeTurnTimer = null;
@@ -562,6 +567,9 @@
           partialTranscript,
           partialTurnConsumed,
           partialTurnTakeoverUsed,
+          pauseMs,
+          cooldownActive: Date.now() < assistantInterjectCooldownUntil,
+          lastInterruptDecision,
           last_speech_started_at: lastSpeechStartedAt,
           last_transcript_update_at: lastTranscriptUpdateAt,
           active_user_transcript: activeUserTranscript,
@@ -790,6 +798,7 @@
       activeUserTranscript = "";
       partialTurnConsumed = false;
       partialTurnTakeoverUsed = false;
+      pauseMs = 0;
       console.log("[Turn state reset]", {
         reason,
         userSpeaking,
@@ -839,53 +848,92 @@
       return /^(嗯|啊|哦|喂|欸|诶|哈|唉|呃)+$/.test(t);
     }
 
-    function decideAssistantInterruption() {
+    function buildRecentHistory() {
+      return messages.slice(-6).map((m) => ({
+        role: m.role,
+        text: m.text || ""
+      }));
+    }
+
+    async function decideAssistantInterruption() {
       const now = Date.now();
       const text = (partialTranscript || "").trim();
-      const pauseMs = now - lastTranscriptUpdateAt;
+      pauseMs = now - lastTranscriptUpdateAt;
       const textLen = text.length;
       const inCooldown = now < assistantInterjectCooldownUntil;
-
-      let action = "none";
-      if (
-        userSpeaking &&
-        !assistantSpeaking &&
-        !hasStrictAssistantActivity() &&
-        !partialTurnConsumed &&
-        !inCooldown &&
-        !isNoisyPartial(text) &&
-        textLen >= 6 &&
-        pauseMs >= 500 &&
-        pauseMs <= 1200
-      ) {
-        const canTakeover =
-          conversationMode === "storytelling"
-            ? textLen >= 22 && pauseMs >= 1000
-            : textLen >= 14 && pauseMs >= 800;
-        if (canTakeover) {
-          action = "takeover";
-        } else if (textLen >= 10) {
-          action = "backchannel";
-        }
-      }
-
-      console.log("[assistant interruption evaluate]", {
-        action,
+      const hasActiveAssistant = hasStrictAssistantActivity();
+      const candidate = {
         userSpeaking,
         assistantSpeaking,
-        hasActiveAssistantTurn: hasActiveAssistantTurn(),
         partialTurnConsumed,
+        partialTurnTakeoverUsed,
         textLen,
         pauseMs,
         inCooldown,
+        hasActiveAssistantTurn: hasActiveAssistant,
         conversationMode,
-      });
-      return action;
+      };
+      console.log("[assistant interruption candidate]", candidate);
+
+      if (
+        !userSpeaking ||
+        assistantSpeaking ||
+        partialTurnConsumed ||
+        inCooldown ||
+        hasActiveAssistant ||
+        textLen < 6 ||
+        pauseMs < 500 ||
+        pauseMs > 1200 ||
+        isNoisyPartial(text)
+      ) {
+        lastInterruptDecision = { action: "none", reason: "frontend_gate", reply_text: "" };
+        updateStatus();
+        return "none";
+      }
+
+      if (interruptDecideInFlight) return "none";
+      if (now - lastInterruptDecideAt < INTERRUPT_DECIDE_MIN_INTERVAL_MS) return "none";
+      interruptDecideInFlight = true;
+      lastInterruptDecideAt = now;
+
+      try {
+        const payload = {
+          mode: conversationMode,
+          partial_text: text,
+          pause_ms: pauseMs,
+          user_speaking: userSpeaking,
+          assistant_speaking: assistantSpeaking,
+          cooldown_active: inCooldown,
+          recent_history: buildRecentHistory(),
+        };
+        console.log("[interrupt_decide request]", payload);
+        const resp = await fetch(`${API_BASE}/interrupt_decide`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!resp.ok) {
+          const errText = await resp.text();
+          throw new Error(`/interrupt_decide failed: ${resp.status} ${errText}`);
+        }
+        const result = await resp.json();
+        console.log("[interrupt_decide response]", result);
+        lastInterruptDecision = result || { action: "none", reason: "empty_result", reply_text: "" };
+        updateStatus();
+        return lastInterruptDecision.action || "none";
+      } catch (err) {
+        console.log("[interrupt_decide error]", err);
+        lastInterruptDecision = { action: "none", reason: "request_error", reply_text: "" };
+        updateStatus();
+        return "none";
+      } finally {
+        interruptDecideInFlight = false;
+      }
     }
 
-    function triggerAssistantBackchannel() {
+    function triggerAssistantBackchannel(replyText = "") {
       const candidates = ["嗯", "好的", "明白", "我在听", "继续说"];
-      const reply = candidates[Math.floor(Math.random() * candidates.length)];
+      const reply = (replyText || "").trim() || candidates[Math.floor(Math.random() * candidates.length)];
       assistantInterjectCooldownUntil = Date.now() + ASSISTANT_INTERJECT_COOLDOWN_MS;
       console.log("[assistant backchannel triggered]", { reply, partialTranscript });
       enqueueTTS(reply, "backchannel");
@@ -1763,6 +1811,7 @@
         // NEW: user speech turn state
         userSpeaking = true;
         lastSpeechStartedAt = Date.now();
+        pauseMs = 0;
         activeUserTranscript = "";
         partialTurnConsumed = false;
         partialTurnTakeoverUsed = false;
@@ -1803,12 +1852,17 @@
             currentTurnId
           });
 
-          const assistantAction = decideAssistantInterruption();
-          if (assistantAction === "backchannel") {
-            triggerAssistantBackchannel();
-          } else if (assistantAction === "takeover") {
-            startAssistantTakeover();
-          }
+          decideAssistantInterruption()
+            .then((assistantAction) => {
+              if (assistantAction === "backchannel") {
+                triggerAssistantBackchannel(lastInterruptDecision.reply_text || "");
+              } else if (assistantAction === "takeover") {
+                startAssistantTakeover();
+              }
+            })
+            .catch((err) => {
+              console.log("[assistant interruption evaluate error]", err);
+            });
         }
         return;
       }
