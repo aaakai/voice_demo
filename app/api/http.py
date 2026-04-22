@@ -12,7 +12,11 @@ import re
 from app.interrupt.classifier import InterruptRequest, classify_interrupt
 from app.memory.session_state import SessionState
 from app.services.agent_service import generate_agent_reply_stream_with_meta
-from app.services.llm_service import generate_raw, generate_raw_openrouter
+from app.services.llm_service import (
+    generate_raw,
+    generate_raw_openrouter,
+    generate_raw_openrouter_messages,
+)
 from app.services.streaming_service import split_stream_for_tts
 
 app = FastAPI()
@@ -63,6 +67,8 @@ class InterruptDecideRequest(BaseModel):
     assistant_speaking: bool
     cooldown_active: bool
     recent_history: list[dict] = []
+    audio_chunk_base64: str | None = None
+    audio_sample_rate: int | None = None
 
 
 @app.get("/health")
@@ -308,6 +314,7 @@ def _build_interrupt_decider_prompt(req: InterruptDecideRequest) -> str:
 
     return (
         "你是实时语音助手的“主动插话决策器”，不是聊天助手。\n"
+        "你可以同时看到用户的部分文本和最近一小段语音音频，请结合语气、停顿、表达完整度做判断。\n"
         "你只能输出一个 JSON 对象，不要输出任何额外文本。\n"
         '输出格式固定：{"action":"none|backchannel|takeover","reason":"...","reply_text":"..."}\n'
         "规则：\n"
@@ -326,12 +333,72 @@ def _build_interrupt_decider_prompt(req: InterruptDecideRequest) -> str:
         f"cooldown_active: {req.cooldown_active}\n"
         f"pause_ms: {req.pause_ms}\n"
         f"partial_text: {req.partial_text}\n"
+        f"audio_present: {bool((req.audio_chunk_base64 or '').strip())}\n"
+        f"audio_sample_rate: {req.audio_sample_rate}\n"
         f"recent_history:\n{hist_text}\n"
     )
 
 
+def _build_interrupt_multimodal_messages(req: InterruptDecideRequest) -> list[dict]:
+    hist = req.recent_history[-4:] if req.recent_history else []
+    hist_lines = []
+    for item in hist:
+        role = str(item.get("role", "unknown"))
+        text = str(item.get("text", ""))
+        hist_lines.append(f"{role}: {text}")
+    hist_text = "\n".join(hist_lines) if hist_lines else "(empty)"
+
+    instruction = (
+        "你是实时语音助手的“主动插话决策器”，不是聊天助手。"
+        "你会收到 partial_text + 最近一小段用户语音，请结合语气和停顿判断是否插话。"
+        "默认用户优先。用户明显没说完返回 none。"
+        "用户停顿且还在表达返回 backchannel。"
+        "用户意图清晰且停顿明显可返回 takeover。storytelling 模式更保守。"
+        "只输出 JSON："
+        '{"action":"none|backchannel|takeover","reason":"...","reply_text":"..."}。'
+        "action=none 时 reply_text 必须为空字符串。"
+    )
+    user_text = (
+        f"mode: {req.mode}\n"
+        f"user_speaking: {req.user_speaking}\n"
+        f"assistant_speaking: {req.assistant_speaking}\n"
+        f"cooldown_active: {req.cooldown_active}\n"
+        f"pause_ms: {req.pause_ms}\n"
+        f"partial_text: {req.partial_text}\n"
+        f"recent_history:\n{hist_text}\n"
+    )
+
+    audio_b64 = (req.audio_chunk_base64 or "").strip()
+    content_items: list[dict] = [{"type": "text", "text": user_text}]
+    if audio_b64:
+        content_items.append(
+            {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": audio_b64,
+                    "format": "pcm16",
+                },
+            }
+        )
+
+    return [
+        {"role": "system", "content": instruction},
+        {"role": "user", "content": content_items},
+    ]
+
+
 @app.post("/interrupt_decide")
 def interrupt_decide(req: InterruptDecideRequest) -> dict:
+    audio_b64 = (req.audio_chunk_base64 or "").strip()
+    audio_sample_rate = req.audio_sample_rate or 0
+    audio_ms = 0
+    if audio_b64 and audio_sample_rate > 0:
+        try:
+            audio_bytes_len = len(base64.b64decode(audio_b64))
+            audio_ms = int((audio_bytes_len / 2 / audio_sample_rate) * 1000)
+        except Exception:  # noqa: BLE001
+            audio_ms = 0
+
     print(
         "[interrupt_decide request]",
         {
@@ -341,6 +408,9 @@ def interrupt_decide(req: InterruptDecideRequest) -> dict:
             "user_speaking": req.user_speaking,
             "assistant_speaking": req.assistant_speaking,
             "cooldown_active": req.cooldown_active,
+            "audio_present": bool(audio_b64),
+            "audio_ms": audio_ms,
+            "audio_sample_rate": audio_sample_rate,
         },
     )
 
@@ -369,15 +439,25 @@ def interrupt_decide(req: InterruptDecideRequest) -> dict:
     print("[interrupt_decide llm start]")
 
     raw = ""
-    try:
-        raw = generate_raw_openrouter(prompt)
-    except Exception as exc:  # noqa: BLE001
-        print("[interrupt_decide openrouter_error]", exc)
+    used_audio_judgement = False
+    if audio_b64:
         try:
-            raw = generate_raw(prompt)
-        except Exception as exc2:  # noqa: BLE001
-            print("[interrupt_decide llm error]", exc2)
-            return {"action": "none", "reason": "llm_error", "reply_text": ""}
+            mm_messages = _build_interrupt_multimodal_messages(req)
+            raw = generate_raw_openrouter_messages(mm_messages)
+            used_audio_judgement = True
+        except Exception as exc:  # noqa: BLE001
+            print("[interrupt_decide multimodal_fallback_to_text]", exc)
+
+    if not raw:
+        try:
+            raw = generate_raw_openrouter(prompt)
+        except Exception as exc:  # noqa: BLE001
+            print("[interrupt_decide openrouter_error]", exc)
+            try:
+                raw = generate_raw(prompt)
+            except Exception as exc2:  # noqa: BLE001
+                print("[interrupt_decide llm error]", exc2)
+                return {"action": "none", "reason": "llm_error", "reply_text": ""}
 
     parsed = _parse_interrupt_decision(raw)
     if not parsed:
@@ -395,7 +475,15 @@ def interrupt_decide(req: InterruptDecideRequest) -> dict:
         reply_text = ""
 
     result = {"action": action, "reason": reason, "reply_text": reply_text}
-    print("[interrupt_decide llm result]", result)
+    print(
+        "[interrupt_decide llm result]",
+        {
+            **result,
+            "used_audio_judgement": used_audio_judgement,
+            "audio_present": bool(audio_b64),
+            "audio_ms": audio_ms,
+        },
+    )
     return result
 
 
@@ -415,6 +503,7 @@ def stream_generated_reply_audio(
     ) + "\n"
 
     full_text = ""
+    tts_input_texts: list[str] = []
     session.state = "speaking"
     session.assistant_speaking = True
     session.playback_stage = "tts_streaming"
@@ -457,7 +546,11 @@ def stream_generated_reply_audio(
                 ensure_ascii=False,
             ) + "\n"
 
-            print("[tts request start]", {"turn_id": turn_id, "text_len": len(text_chunk)})
+            print(
+                "[tts request start]",
+                {"turn_id": turn_id, "text_len": len(text_chunk), "text": text_chunk},
+            )
+            tts_input_texts.append(text_chunk)
             upstream = None
             try:
                 upstream = _open_tts_stream(text_chunk)
@@ -537,6 +630,15 @@ def stream_generated_reply_audio(
     session.playback_stage = "idle"
     session.state = "idle"
 
+    print("[LLM FINAL REPLY]", {"turn_id": turn_id, "reply": full_text})
+    print(
+        "[TTS INPUT TEXT]",
+        {
+            "turn_id": turn_id,
+            "text": "".join(tts_input_texts),
+            "segments": tts_input_texts,
+        },
+    )
     print("[stream_reply_audio done]", {"turn_id": turn_id, "full_text_len": len(full_text)})
     yield json.dumps(
         {

@@ -98,6 +98,47 @@ def generate_raw_openrouter(prompt: str, model: str | None = None) -> str:
         raise RuntimeError(f"openrouter non-stream request failed: {exc}") from exc
 
 
+def generate_raw_openrouter_messages(
+    messages: list[dict],
+    model: str | None = None,
+) -> str:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set")
+
+    req_model = model or OPENROUTER_PLANNER_MODEL
+    payload = {
+        "model": req_model,
+        "messages": messages,
+        "stream": False,
+    }
+
+    print("openrouter non-stream multimodal request started:", {"model": req_model})
+    try:
+        resp = requests.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=60,
+        )
+        if not resp.ok:
+            raise RuntimeError(
+                f"openrouter multimodal error: status={resp.status_code} body={resp.text}"
+            )
+        data = resp.json()
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+        return (content or "").strip()
+    except requests.RequestException as exc:
+        raise RuntimeError(f"openrouter multimodal request failed: {exc}") from exc
+
+
 def _build_openrouter_messages(history, user_input: str, mode: str = "chat") -> list[dict]:
     if mode == "storytelling":
         system_content = (

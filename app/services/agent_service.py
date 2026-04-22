@@ -104,6 +104,7 @@ def _parse_plan_json(raw_text: str) -> dict[str, Any] | None:
 
 def plan_agent_action(history, user_input: str) -> dict[str, Any]:
     planner_prompt = _build_planner_prompt(history, user_input)
+    raw_plan = ""
     try:
         raw_plan = generate_raw_openrouter(
             planner_prompt,
@@ -118,6 +119,7 @@ def plan_agent_action(history, user_input: str) -> dict[str, Any]:
             print("agent planner ollama fallback failed:", inner_exc)
             return {"type": "direct_answer", "reply": ""}
 
+    print("[agent_plan raw]", raw_plan)
     parsed = _parse_plan_json(raw_plan)
 
     if not isinstance(parsed, dict):
@@ -127,6 +129,7 @@ def plan_agent_action(history, user_input: str) -> dict[str, Any]:
 
     if plan_type == "direct_answer":
         reply = parsed.get("reply", "")
+        print("[agent_plan reply]", reply if isinstance(reply, str) else "")
         return {
             "type": "direct_answer",
             "reply": reply if isinstance(reply, str) else "",

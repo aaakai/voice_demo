@@ -411,6 +411,13 @@
 
     const API_BASE = "http://127.0.0.1:8000";
     const OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls";
+    const DEEPGRAM_API_KEY = "3ec3198b194bb464cb82aa5f8cbd99b36e4db49a";
+    const DEEPGRAM_URL =
+      "wss://api.deepgram.com/v1/listen?model=nova-3&language=zh-CN&interim_results=true&endpointing=1000&encoding=linear16&sample_rate=16000&smart_format=true&punctuate=true&diarize=false";
+    const DEEPGRAM_TARGET_SAMPLE_RATE = 16000;
+    const DEEPGRAM_CHUNK_MS = 60; // 20ms~100ms
+    const DEEPGRAM_CHUNK_BYTES = Math.floor((DEEPGRAM_TARGET_SAMPLE_RATE * 2 * DEEPGRAM_CHUNK_MS) / 1000);
+    const DEEPGRAM_VAD_RMS_THRESHOLD = 0.006;
 
     let sessionId = "web-demo-s1";
     let messages = [];
@@ -419,6 +426,9 @@
     let currentTurnId = null;
     let currentTurnActive = false;
     let activeAssistantMessageId = null;
+    let activeUserMessageId = null;
+    let activeUserMessageText = "";
+    let activeUserMessageTurnSeq = 0;
     let conversationMode = "chat";
     let storyAutoContinueCount = 0;
     const STORY_AUTO_CONTINUE_MAX = 2;
@@ -452,7 +462,22 @@
 
     let rtcPc = null;
     let rtcDc = null;
+    let deepgramWs = null;
+    let deepgramTurnCounter = 0;
+    let deepgramCurrentItemId = null;
+    let deepgramAudioByteBuffer = new Uint8Array(0);
+    let deepgramReconnectTimer = null;
+    let deepgramFinalizeTimer = null;
     let micStream = null;
+    let micCaptureCtx = null;
+    let micCaptureSource = null;
+    let micCaptureProcessor = null;
+    let micRingBuffer = null;
+    let micRingBufferSize = 0;
+    let micRingWriteIndex = 0;
+    let micRingFilled = false;
+    let micCaptureSampleRate = 0;
+    let lastAudioChunkDurationMs = 0;
     let remoteAudioEl = null;
     let realtimeModel = "gpt-realtime";
 
@@ -497,6 +522,7 @@
 
     let sessionTimerSec = 0;
     let timerHandle = null;
+    let interruptionEvalTimer = null;
 
     function nowTime() {
       const d = new Date();
@@ -547,6 +573,9 @@
           pcm_current_turn_id: pcmCurrentTurnId,
           last_tts_flush_text: lastTtsFlushText,
           last_audio_chunk_size: lastAudioChunkSize,
+          audio_buffer_size: micRingFilled ? micRingBufferSize : micRingWriteIndex,
+          last_audio_chunk_duration_ms: lastAudioChunkDurationMs,
+          mic_capture_sample_rate: micCaptureSampleRate,
           realtime_connected: !!rtcPc && rtcPc.connectionState === "connected",
           currentTranscript: currentTranscript,
           currentCompletedTranscript: currentCompletedTranscript,
@@ -579,9 +608,15 @@
           rtc_connection_state: rtcConnectionState,
           rtc_data_channel_open: rtcDataChannelOpen,
           current_turn_id: currentTurnId,
+          currentTurnId,
           current_turn_active: currentTurnActive,
+          currentTurnActive,
           current_assistant_text:
             (messages.find((m) => m.id === activeAssistantMessageId) || {}).text || "",
+          activeUserMessageText,
+          active_user_message_id: activeUserMessageId,
+          active_user_message_turn_seq: activeUserMessageTurnSeq,
+          lastInterruptionAction: (lastInterruptDecision || {}).action || "none",
           conversation_mode: conversationMode,
           story_auto_continue_count: storyAutoContinueCount,
         },
@@ -647,7 +682,7 @@
         time.textContent = m.time;
         right.appendChild(time);
 
-        if (m.role === "assistant") {
+        if (m.role === "assistant" || (m.role === "user" && m.status === "streaming")) {
           const status = document.createElement("span");
           status.className = `status-pill ${m.status || "done"}`;
           status.textContent = m.status || "done";
@@ -659,7 +694,11 @@
 
         const body = document.createElement("div");
         body.className = "body";
-        body.textContent = m.text || "...";
+        if (m.role === "user" && m.status === "streaming") {
+          body.textContent = m.text || "";
+        } else {
+          body.textContent = m.text || "...";
+        }
 
         bubble.appendChild(meta);
         bubble.appendChild(body);
@@ -687,6 +726,325 @@
       out.set(a, 0);
       out.set(b, a.length);
       return out;
+    }
+
+    function downsampleFloat32(samples, inRate, outRate) {
+      if (!samples || samples.length === 0) return new Float32Array(0);
+      if (!inRate || !outRate || inRate === outRate) return samples;
+      const ratio = inRate / outRate;
+      const outLength = Math.max(1, Math.floor(samples.length / ratio));
+      const out = new Float32Array(outLength);
+      for (let i = 0; i < outLength; i++) {
+        const start = Math.floor(i * ratio);
+        const end = Math.min(samples.length, Math.floor((i + 1) * ratio));
+        let sum = 0;
+        let count = 0;
+        for (let j = start; j < end; j++) {
+          sum += samples[j];
+          count += 1;
+        }
+        out[i] = count > 0 ? sum / count : 0;
+      }
+      return out;
+    }
+
+    function float32ToInt16Bytes(samples) {
+      const out = new Uint8Array(samples.length * 2);
+      const view = new DataView(out.buffer);
+      for (let i = 0; i < samples.length; i++) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        const v = s < 0 ? Math.round(s * 32768) : Math.round(s * 32767);
+        view.setInt16(i * 2, v, true);
+      }
+      return out;
+    }
+
+    function uint8ToBase64(bytes) {
+      let binary = "";
+      const chunkSize = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        const chunk = bytes.subarray(i, i + chunkSize);
+        binary += String.fromCharCode.apply(null, chunk);
+      }
+      return btoa(binary);
+    }
+
+    function connectDeepgram() {
+      if (deepgramWs && (deepgramWs.readyState === WebSocket.OPEN || deepgramWs.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+      if (!DEEPGRAM_API_KEY) {
+        console.log("[Deepgram] API key missing");
+        return;
+      }
+      try {
+        deepgramWs = new WebSocket(DEEPGRAM_URL, ["token", DEEPGRAM_API_KEY]);
+        deepgramWs.binaryType = "arraybuffer";
+        deepgramWs.onopen = () => {
+          if (deepgramReconnectTimer) {
+            clearTimeout(deepgramReconnectTimer);
+            deepgramReconnectTimer = null;
+          }
+          console.log("[Deepgram ws open]");
+        };
+        deepgramWs.onerror = (err) => {
+          console.log("[Deepgram ws error]", err);
+        };
+        deepgramWs.onclose = (ev) => {
+          console.log("[Deepgram ws close]", { code: ev.code, reason: ev.reason });
+          deepgramWs = null;
+          if (shouldKeepListening) {
+            if (deepgramReconnectTimer) clearTimeout(deepgramReconnectTimer);
+            deepgramReconnectTimer = setTimeout(() => {
+              deepgramReconnectTimer = null;
+              if (shouldKeepListening) connectDeepgram();
+            }, 300);
+          }
+        };
+        deepgramWs.onmessage = (ev) => {
+          handleDeepgramMessage(ev.data);
+        };
+      } catch (err) {
+        console.log("[Deepgram] connect failed", err);
+      }
+    }
+
+    function closeDeepgram() {
+      if (deepgramReconnectTimer) {
+        clearTimeout(deepgramReconnectTimer);
+        deepgramReconnectTimer = null;
+      }
+      if (deepgramFinalizeTimer) {
+        clearTimeout(deepgramFinalizeTimer);
+        deepgramFinalizeTimer = null;
+      }
+      if (!deepgramWs) return;
+      try { deepgramWs.close(); } catch {}
+      deepgramWs = null;
+      deepgramCurrentItemId = null;
+      deepgramAudioByteBuffer = new Uint8Array(0);
+    }
+
+    function ensureDeepgramInputTurn() {
+      if (!deepgramCurrentItemId || !userSpeaking) {
+        deepgramCurrentItemId = `dg-${Date.now()}-${++deepgramTurnCounter}`;
+        ensureInputTurnFromEvent(deepgramCurrentItemId, "deepgram_partial_start");
+      }
+    }
+
+    function handleDeepgramMessage(raw) {
+      let msg;
+      try {
+        msg = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      const alt = (((msg || {}).channel || {}).alternatives || [])[0] || {};
+      const transcript = (alt.transcript || "").trim();
+      console.log("[Deepgram result raw]", msg);
+      console.log("[Deepgram transcript]", {
+        transcript,
+        confidence: alt.confidence ?? null,
+        is_final: !!msg.is_final,
+        speech_final: !!msg.speech_final,
+      });
+      const isFinal = !!msg.is_final || !!msg.speech_final;
+
+      if (transcript) {
+        handleUserPartial(transcript);
+      }
+      if (isFinal && transcript) {
+        if (deepgramFinalizeTimer) {
+          clearTimeout(deepgramFinalizeTimer);
+          deepgramFinalizeTimer = null;
+        }
+        if (transcript.length > 5) {
+          handleUserFinal(transcript);
+        } else {
+          deepgramFinalizeTimer = setTimeout(() => {
+            deepgramFinalizeTimer = null;
+            const stableText = (partialTranscript || transcript || "").trim();
+            if (stableText) handleUserFinal(stableText);
+          }, 300);
+        }
+      }
+    }
+
+    function handleUserPartial(text) {
+      const t = text || "";
+      if (!t.trim()) return;
+
+      ensureDeepgramInputTurn();
+      ensureActiveUserStreamingMessage(currentInputTurnSeq);
+
+      partialTranscript = t;
+      activeUserTranscript = t;
+      currentTranscript = t;
+      userSpeaking = true;
+      lastTranscriptUpdateAt = Date.now();
+
+      setLiveTranscript(t);
+      updateActiveUserStreamingText(t, currentInputTurnSeq);
+
+      decideAssistantInterruption()
+        .then((assistantAction) => {
+          if (assistantAction === "backchannel") {
+            triggerAssistantBackchannel(lastInterruptDecision.reply_text || "");
+          } else if (assistantAction === "takeover") {
+            startAssistantTakeover();
+          }
+        })
+        .catch((err) => {
+          console.log("[assistant interruption evaluate error]", err);
+        });
+    }
+
+    function handleUserFinal(text) {
+      const t = (text || partialTranscript || currentTranscript || activeUserTranscript || "").trim();
+      userSpeaking = false;
+      if (t) {
+        currentCompletedTranscript = t;
+        currentTranscript = t;
+        partialTranscript = t;
+        activeUserTranscript = t;
+        setLiveTranscript(t);
+      }
+      finalizeActiveUserStreamingMessage(t, currentInputTurnSeq, "deepgram_final");
+      finalizeUserTurn("deepgram_final").catch((err) => {
+        streamDebugEl.textContent = JSON.stringify(
+          { phase: "finalize_error", error: err.message },
+          null,
+          2
+        );
+      });
+      deepgramCurrentItemId = null;
+    }
+
+    function initMicAudioBuffer(stream) {
+      try {
+        destroyMicAudioBuffer();
+        micCaptureCtx = new (window.AudioContext || window.webkitAudioContext)();
+        micCaptureSampleRate = micCaptureCtx.sampleRate || 48000;
+        micRingBufferSize = Math.max(1, Math.floor(micCaptureSampleRate * 1.0));
+        micRingBuffer = new Float32Array(micRingBufferSize);
+        micRingWriteIndex = 0;
+        micRingFilled = false;
+
+        micCaptureSource = micCaptureCtx.createMediaStreamSource(stream);
+        micCaptureProcessor = micCaptureCtx.createScriptProcessor(2048, 1, 1);
+        micCaptureProcessor.onaudioprocess = (e) => {
+          if (!micRingBuffer) return;
+          const input = e.inputBuffer.getChannelData(0);
+          for (let i = 0; i < input.length; i++) {
+            micRingBuffer[micRingWriteIndex] = input[i];
+            micRingWriteIndex = (micRingWriteIndex + 1) % micRingBufferSize;
+            if (micRingWriteIndex === 0) micRingFilled = true;
+          }
+          if (!deepgramWs || deepgramWs.readyState !== WebSocket.OPEN) {
+            connectDeepgram();
+            return;
+          }
+          if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) {
+            try {
+              const down = downsampleFloat32(
+                input,
+                micCaptureSampleRate,
+                DEEPGRAM_TARGET_SAMPLE_RATE
+              );
+              if (!down || down.length === 0) return;
+
+              let energy = 0;
+              for (let i = 0; i < down.length; i++) {
+                energy += down[i] * down[i];
+              }
+              const rms = Math.sqrt(energy / down.length);
+              if (rms < DEEPGRAM_VAD_RMS_THRESHOLD) {
+                return;
+              }
+
+              const int16Bytes = float32ToInt16Bytes(down);
+              deepgramAudioByteBuffer = concatUint8(deepgramAudioByteBuffer, int16Bytes);
+
+              while (deepgramAudioByteBuffer.length >= DEEPGRAM_CHUNK_BYTES) {
+                const chunk = deepgramAudioByteBuffer.slice(0, DEEPGRAM_CHUNK_BYTES);
+                deepgramAudioByteBuffer = deepgramAudioByteBuffer.slice(DEEPGRAM_CHUNK_BYTES);
+                deepgramWs.send(chunk.buffer);
+                console.log("[Deepgram send chunk]", {
+                  sample_rate: DEEPGRAM_TARGET_SAMPLE_RATE,
+                  bytes: chunk.byteLength,
+                  chunk_ms: DEEPGRAM_CHUNK_MS,
+                  rms: Number(rms.toFixed(6)),
+                });
+              }
+            } catch (err) {
+              console.log("[Deepgram] send audio error", err);
+            }
+          }
+        };
+        micCaptureSource.connect(micCaptureProcessor);
+        micCaptureProcessor.connect(micCaptureCtx.destination);
+      } catch (err) {
+        console.log("[mic audio buffer init error]", err);
+        destroyMicAudioBuffer();
+      }
+    }
+
+    function destroyMicAudioBuffer() {
+      try {
+        if (micCaptureProcessor) micCaptureProcessor.disconnect();
+      } catch {}
+      try {
+        if (micCaptureSource) micCaptureSource.disconnect();
+      } catch {}
+      try {
+        if (micCaptureCtx) micCaptureCtx.close();
+      } catch {}
+      micCaptureProcessor = null;
+      micCaptureSource = null;
+      micCaptureCtx = null;
+      micCaptureSampleRate = 0;
+      micRingBuffer = null;
+      micRingBufferSize = 0;
+      micRingWriteIndex = 0;
+      micRingFilled = false;
+      lastAudioChunkDurationMs = 0;
+    }
+
+    function getRecentAudioChunkBase64(maxMs = 800, targetSampleRate = 16000) {
+      if (!micRingBuffer || !micCaptureSampleRate || micRingBufferSize === 0) {
+        lastAudioChunkDurationMs = 0;
+        return { audioBase64: "", sampleRate: targetSampleRate, durationMs: 0 };
+      }
+
+      const available = micRingFilled ? micRingBufferSize : micRingWriteIndex;
+      if (available <= 0) {
+        lastAudioChunkDurationMs = 0;
+        return { audioBase64: "", sampleRate: targetSampleRate, durationMs: 0 };
+      }
+
+      const wanted = Math.min(
+        available,
+        Math.max(1, Math.floor((micCaptureSampleRate * maxMs) / 1000))
+      );
+      const out = new Float32Array(wanted);
+      const start = (micRingWriteIndex - wanted + micRingBufferSize) % micRingBufferSize;
+      if (start + wanted <= micRingBufferSize) {
+        out.set(micRingBuffer.subarray(start, start + wanted), 0);
+      } else {
+        const firstLen = micRingBufferSize - start;
+        out.set(micRingBuffer.subarray(start), 0);
+        out.set(micRingBuffer.subarray(0, wanted - firstLen), firstLen);
+      }
+
+      const down = downsampleFloat32(out, micCaptureSampleRate, targetSampleRate);
+      const int16Bytes = float32ToInt16Bytes(down);
+      const durationMs = Math.floor((down.length / targetSampleRate) * 1000);
+      lastAudioChunkDurationMs = durationMs;
+      return {
+        audioBase64: uint8ToBase64(int16Bytes),
+        sampleRate: targetSampleRate,
+        durationMs,
+      };
     }
 
     function pcmBytesToFloat32(pcmBytes) {
@@ -792,7 +1150,28 @@
       return currentTurnActive || !!currentStreamController || assistantSpeaking || pcmPlaying;
     }
 
+    function clearActiveUserStreamingMessage(reason = "unknown") {
+      if (!activeUserMessageId) return;
+      const msg = messages.find((m) => m.id === activeUserMessageId);
+      const text = ((msg && msg.text) || activeUserMessageText || "").trim();
+      if (!text) {
+        messages = messages.filter((m) => m.id !== activeUserMessageId);
+        renderMessages();
+      } else {
+        updateMessage(activeUserMessageId, { text, status: "done" });
+      }
+      console.log("[user streaming message cleared]", {
+        reason,
+        had_text: !!text,
+        removed_empty: !text,
+      });
+      activeUserMessageId = null;
+      activeUserMessageText = "";
+      activeUserMessageTurnSeq = 0;
+    }
+
     function resetUserSpeechState(reason = "unknown") {
+      clearActiveUserStreamingMessage(reason);
       userSpeaking = false;
       partialTranscript = "";
       activeUserTranscript = "";
@@ -806,6 +1185,107 @@
         partialTurnConsumed,
         partialTurnTakeoverUsed,
       });
+    }
+
+    function resetUserTurnFlagsOnly(reason = "unknown") {
+      partialTranscript = "";
+      activeUserTranscript = "";
+      partialTurnConsumed = false;
+      partialTurnTakeoverUsed = false;
+      pauseMs = 0;
+      console.log("[resetUserTurnFlagsOnly]", {
+        reason,
+        partialTranscript,
+        partialTurnConsumed,
+        partialTurnTakeoverUsed,
+      });
+    }
+
+    function ensureActiveUserStreamingMessage(turnSeq = 0) {
+      if (activeUserMessageId) return activeUserMessageId;
+      const msg = appendMessage("user", "", {
+        status: "streaming",
+        turnId: `input-${turnSeq || (currentInputTurnSeq + 1)}`
+      });
+      activeUserMessageId = msg.id;
+      activeUserMessageText = "";
+      activeUserMessageTurnSeq = turnSeq || (currentInputTurnSeq + 1);
+      console.log("[user streaming message created]", {
+        id: activeUserMessageId,
+        turnSeq: activeUserMessageTurnSeq,
+      });
+      return activeUserMessageId;
+    }
+
+    function updateActiveUserStreamingText(text, turnSeq = 0) {
+      const t = text || "";
+      ensureActiveUserStreamingMessage(turnSeq || currentInputTurnSeq);
+      activeUserMessageText = t;
+      if (activeUserMessageId) {
+        updateMessage(activeUserMessageId, {
+          text: t,
+          status: "streaming",
+          turnId: `input-${turnSeq || currentInputTurnSeq || activeUserMessageTurnSeq || 0}`
+        });
+      }
+      if (turnSeq) activeUserMessageTurnSeq = turnSeq;
+      console.log("[user streaming message updated]", {
+        id: activeUserMessageId,
+        turnSeq: activeUserMessageTurnSeq || turnSeq || currentInputTurnSeq,
+        text: t,
+      });
+      updateStatus();
+    }
+
+    function finalizeActiveUserStreamingMessage(finalText, turnSeq = 0, reason = "finalize") {
+      const text = (finalText || activeUserMessageText || partialTranscript || "").trim();
+      if (!text) {
+        if (activeUserMessageId) {
+          messages = messages.filter((m) => m.id !== activeUserMessageId);
+          renderMessages();
+        }
+        console.log("[user streaming message finalized]", {
+          reason,
+          turnSeq: turnSeq || activeUserMessageTurnSeq || currentInputTurnSeq || 0,
+          text: "",
+          removed_empty: true,
+        });
+        activeUserMessageId = null;
+        activeUserMessageText = "";
+        activeUserMessageTurnSeq = 0;
+        updateStatus();
+        return;
+      }
+
+      if (activeUserMessageId) {
+        updateMessage(activeUserMessageId, {
+          text,
+          status: "done",
+          turnId: `input-${turnSeq || activeUserMessageTurnSeq || currentInputTurnSeq || 0}`
+        });
+      } else {
+        appendMessage("user", text, {
+          status: "done",
+          turnId: `input-${turnSeq || currentInputTurnSeq || 0}`
+        });
+      }
+      if (reason === "takeover") {
+        console.log("[user streaming message takeover finalized]", {
+          turnSeq: turnSeq || currentInputTurnSeq || 0,
+          text,
+        });
+      } else {
+        console.log("[user streaming message finalized]", {
+          reason,
+          turnSeq: turnSeq || currentInputTurnSeq || 0,
+          text,
+          removed_empty: false,
+        });
+      }
+      activeUserMessageId = null;
+      activeUserMessageText = "";
+      activeUserMessageTurnSeq = 0;
+      updateStatus();
     }
 
     function interruptCurrentTurn(reason = "manual") {
@@ -861,8 +1341,9 @@
       pauseMs = now - lastTranscriptUpdateAt;
       const textLen = text.length;
       const inCooldown = now < assistantInterjectCooldownUntil;
-      const hasActiveAssistant = hasStrictAssistantActivity();
+      const hasActiveAssistant = hasActiveAssistantTurn();
       const candidate = {
+        partialTranscript: text,
         userSpeaking,
         assistantSpeaking,
         partialTurnConsumed,
@@ -880,13 +1361,17 @@
         assistantSpeaking ||
         partialTurnConsumed ||
         inCooldown ||
-        hasActiveAssistant ||
         textLen < 6 ||
-        pauseMs < 500 ||
-        pauseMs > 1200 ||
+        pauseMs < 350 ||
+        pauseMs > 1500 ||
         isNoisyPartial(text)
       ) {
         lastInterruptDecision = { action: "none", reason: "frontend_gate", reply_text: "" };
+        console.log("[assistant interruption evaluate]", {
+          ...candidate,
+          cooldownActive: inCooldown,
+          action: "none",
+        });
         updateStatus();
         return "none";
       }
@@ -905,8 +1390,18 @@
           assistant_speaking: assistantSpeaking,
           cooldown_active: inCooldown,
           recent_history: buildRecentHistory(),
+          audio_chunk_base64: "",
+          audio_sample_rate: 16000,
         };
-        console.log("[interrupt_decide request]", payload);
+        const audioPacket = getRecentAudioChunkBase64(800, 16000);
+        payload.audio_chunk_base64 = audioPacket.audioBase64 || "";
+        payload.audio_sample_rate = audioPacket.sampleRate || 16000;
+        console.log("[interrupt_decide request]", {
+          ...payload,
+          audio_chunk_base64: payload.audio_chunk_base64 ? "<base64>" : "",
+          audio_base64_len: payload.audio_chunk_base64 ? payload.audio_chunk_base64.length : 0,
+          audio_duration_ms: audioPacket.durationMs || 0,
+        });
         const resp = await fetch(`${API_BASE}/interrupt_decide`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -919,16 +1414,59 @@
         const result = await resp.json();
         console.log("[interrupt_decide response]", result);
         lastInterruptDecision = result || { action: "none", reason: "empty_result", reply_text: "" };
+        let action = lastInterruptDecision.action || "none";
+        if (action === "none") {
+          if (textLen >= 12 && pauseMs >= 600) action = "takeover";
+          else if (textLen >= 6) action = "backchannel";
+        }
+        console.log("[assistant interruption evaluate]", {
+          ...candidate,
+          cooldownActive: inCooldown,
+          action,
+        });
         updateStatus();
-        return lastInterruptDecision.action || "none";
+        return action;
       } catch (err) {
         console.log("[interrupt_decide error]", err);
-        lastInterruptDecision = { action: "none", reason: "request_error", reply_text: "" };
+        let action = "none";
+        if (textLen >= 12 && pauseMs >= 600) action = "takeover";
+        else if (textLen >= 6) action = "backchannel";
+        lastInterruptDecision = { action, reason: "request_error_fallback", reply_text: "" };
+        console.log("[assistant interruption evaluate]", {
+          ...candidate,
+          cooldownActive: inCooldown,
+          action,
+        });
         updateStatus();
-        return "none";
+        return action;
       } finally {
         interruptDecideInFlight = false;
       }
+    }
+
+    function scheduleInterruptionEvalTick() {
+      if (interruptionEvalTimer) return;
+      interruptionEvalTimer = setInterval(() => {
+        if (!shouldKeepListening) return;
+        if (!userSpeaking) return;
+        if (partialTurnConsumed) return;
+        if (!(partialTranscript || "").trim()) return;
+        decideAssistantInterruption()
+          .then((assistantAction) => {
+            if (assistantAction === "backchannel") {
+              triggerAssistantBackchannel(lastInterruptDecision.reply_text || "");
+            } else if (assistantAction === "takeover") {
+              startAssistantTakeover();
+            }
+          })
+          .catch((err) => console.log("[assistant interruption evaluate error]", err));
+      }, 400);
+    }
+
+    function stopInterruptionEvalTick() {
+      if (!interruptionEvalTimer) return;
+      clearInterval(interruptionEvalTimer);
+      interruptionEvalTimer = null;
     }
 
     function triggerAssistantBackchannel(replyText = "") {
@@ -960,7 +1498,7 @@
         turnSeqAtTakeover,
       });
 
-      appendMessage("user", text, { status: "done" });
+      finalizeActiveUserStreamingMessage(text, turnSeqAtTakeover, "takeover");
       streamReply(text, { mode: conversationMode }).catch((err) => {
         streamDebugEl.textContent = JSON.stringify(
           { phase: "assistant_takeover_stream_error", error: err.message },
@@ -1460,6 +1998,27 @@
     function ensureInputTurnFromEvent(itemId, source) {
       if (!itemId) return;
       if (itemId === activeInputItemId) return;
+      console.log("[ensureInputTurnFromEvent]", {
+        source,
+        itemId,
+        activeInputItemId,
+        currentInputTurnSeq,
+        finalizedInputTurnSeq,
+      });
+      const hasUnfinishedInputTurn =
+        currentInputTurnSeq > 0 && finalizedInputTurnSeq < currentInputTurnSeq;
+      if (hasUnfinishedInputTurn) {
+        // Same utterance may emit different item_id across speech_started/delta/completed.
+        // Keep one input turn seq to avoid duplicate consumption.
+        activeInputItemId = itemId;
+        console.log("[input item rebound]", {
+          source,
+          itemId,
+          currentInputTurnSeq,
+          finalizedInputTurnSeq,
+        });
+        return;
+      }
       currentInputTurnSeq += 1;
       clearFinalizeTurnTimer();
       pendingFinalize = false;
@@ -1467,7 +2026,7 @@
       activeInputItemId = itemId;
       currentTranscript = "";
       currentCompletedTranscript = "";
-      resetUserSpeechState(`ensure_input_turn:${source}`);
+      resetUserTurnFlagsOnly(`ensure_input_turn:${source}`);
       console.log("[Turn state reset]", {
         reason: source,
         pendingFinalize,
@@ -1599,6 +2158,7 @@
       for (const track of micStream.getTracks()) {
         rtcPc.addTrack(track, micStream);
       }
+      initMicAudioBuffer(micStream);
 
       const offer = await rtcPc.createOffer();
       await rtcPc.setLocalDescription(offer);
@@ -1635,6 +2195,7 @@
         for (const t of micStream.getTracks()) t.stop();
       }
       micStream = null;
+      destroyMicAudioBuffer();
       resetUserSpeechState("close_realtime_connection");
 
       recognitionRunning = false;
@@ -1680,6 +2241,11 @@
           triggerReason,
           currentInputTurnSeq,
         });
+        finalizeActiveUserStreamingMessage(
+          currentCompletedTranscript || currentTranscript || activeUserTranscript,
+          currentInputTurnSeq,
+          "partial_turn_consumed"
+        );
         resetTranscriptTurnBuffer();
         return;
       }
@@ -1697,8 +2263,14 @@
         console.log("[Finalize candidate]", {
           transcript: currentTranscript,
           completed: currentCompletedTranscript,
+          partialTurnConsumed,
+          partialTurnTakeoverUsed,
           pendingFinalize,
           finalizingUserTurn,
+          currentInputTurnSeq,
+          finalizedInputTurnSeq,
+          appendedUserMessageTurnSeq,
+          streamTriggeredTurnSeq,
           assistantSpeaking,
           pcmPlaying,
           audioQueueLength: pcmQueue.length,
@@ -1730,6 +2302,11 @@
         });
 
         finalizedInputTurnSeq = Math.max(finalizedInputTurnSeq, turnSeqAtStart);
+        finalizeActiveUserStreamingMessage(
+          finalText || fallbackText || completedText,
+          turnSeqAtStart,
+          "finalize"
+        );
         resetTranscriptTurnBuffer();
         if (!finalText) return;
         if (finalText.length <= 6 && isLikelyEcho(finalText)) {
@@ -1750,11 +2327,11 @@
 
         if (appendedUserMessageTurnSeq >= turnSeqAtStart) return;
         appendedUserMessageTurnSeq = turnSeqAtStart;
-        appendMessage("user", finalText, { status: "done" });
+        // user message already finalized from active streaming bubble
 
         if (streamTriggeredTurnSeq >= turnSeqAtStart) return;
         streamTriggeredTurnSeq = turnSeqAtStart;
-        console.log("[Trigger stream_reply]", {
+      console.log("[Trigger stream_reply_audio]", {
           turn_seq: turnSeqAtStart,
           turnSeq: turnSeqAtStart,
           mode: conversationMode,
@@ -1803,7 +2380,6 @@
           });
           interruptCurrentTurn("user_interrupt");
         }
-        ensureInputTurnFromEvent(evt.item_id, "speech_started");
         currentTranscript = "";
         currentCompletedTranscript = "";
         partialTranscript = "";
@@ -1832,38 +2408,7 @@
         evt.type === "conversation.item.input_audio_transcription.delta" ||
         evt.type === "input_audio_transcription.delta"
       ) {
-        ensureInputTurnFromEvent(evt.item_id, "delta_new_item");
-        const delta = evt.delta || "";
-        if (delta) {
-          currentTranscript += delta;
-          partialTranscript = currentTranscript.trim();
-          // NEW: accumulate backchannel transcript
-          activeUserTranscript += delta;
-          lastTranscriptUpdateAt = Date.now();
-          setLiveTranscript(currentTranscript);
-          console.log("[partial transcript updated]", {
-            partialTranscript,
-            length: partialTranscript.length,
-          });
-          console.log("[Realtime transcript state]", {
-            transcript: currentTranscript,
-            completed: currentCompletedTranscript,
-            activeInputItemId,
-            currentTurnId
-          });
-
-          decideAssistantInterruption()
-            .then((assistantAction) => {
-              if (assistantAction === "backchannel") {
-                triggerAssistantBackchannel(lastInterruptDecision.reply_text || "");
-              } else if (assistantAction === "takeover") {
-                startAssistantTakeover();
-              }
-            })
-            .catch((err) => {
-              console.log("[assistant interruption evaluate error]", err);
-            });
-        }
+        // Disabled: transcript now comes from Deepgram WebSocket.
         return;
       }
 
@@ -1872,66 +2417,7 @@
         evt.type === "conversation.item.input_audio_transcription.completed" ||
         evt.type === "input_audio_transcription.completed"
       ) {
-        ensureInputTurnFromEvent(evt.item_id, "completed_new_item");
-        const transcript = (evt.transcript || "").trim();
-        console.log("[Completed transcript received]", {
-          transcript,
-          turn_seq: currentInputTurnSeq,
-          pending_finalize: pendingFinalize,
-          finalizing_user_turn: finalizingUserTurn,
-        });
-        if (transcript) {
-          currentCompletedTranscript = transcript;
-          partialTranscript = transcript;
-          // NEW: keep user-side active transcript up-to-date
-          activeUserTranscript = transcript;
-          setLiveTranscript(transcript);
-        }
-        console.log("[Realtime transcript state]", {
-          transcript: currentTranscript,
-          completed: currentCompletedTranscript,
-          activeInputItemId,
-          currentTurnId
-        });
-
-        // 若已收到 speech_stopped，completed 到达后立即 finalize
-        if (pendingFinalize) {
-          clearFinalizeTurnTimer();
-          console.log("[Finalize candidate]", {
-            reason: "completed_with_pending_finalize",
-            turn_seq: currentInputTurnSeq,
-          });
-          finalizeUserTurn("completed_with_pending_finalize").catch((err) => {
-            streamDebugEl.textContent = JSON.stringify(
-              { phase: "finalize_error", error: err.message },
-              null,
-              2
-            );
-          });
-        } else if (
-          transcript &&
-          !finalizingUserTurn &&
-          currentInputTurnSeq > finalizedInputTurnSeq &&
-          streamTriggeredTurnSeq < currentInputTurnSeq
-        ) {
-          clearFinalizeTurnTimer();
-          pendingFinalize = true;
-          console.log("[Finalize candidate]", {
-            reason: "completed_fallback_timer",
-            delay: 200,
-            turn_seq: currentInputTurnSeq,
-          });
-          finalizeTurnTimer = setTimeout(() => {
-            finalizeTurnTimer = null;
-            finalizeUserTurn("completed_fallback_timer").catch((err) => {
-              streamDebugEl.textContent = JSON.stringify(
-                { phase: "finalize_error", error: err.message },
-                null,
-                2
-              );
-            });
-          }, 200);
-        }
+        // Disabled: transcript now comes from Deepgram WebSocket.
         return;
       }
 
@@ -1949,6 +2435,8 @@
     startBtn.onclick = () => {
       shouldKeepListening = true;
       startTimer();
+      scheduleInterruptionEvalTick();
+      connectDeepgram();
       startRecognitionSafely();
     };
 
@@ -1959,6 +2447,8 @@
       pendingFinalize = false;
       storyAutoContinueCount = 0;
       stopCurrentPlayback("manual_stop");
+      stopInterruptionEvalTick();
+      closeDeepgram();
       resetUserSpeechState("stop_btn");
       stopTimer();
       setRecognitionState("idle");
@@ -1971,6 +2461,8 @@
       clearFinalizeTurnTimer();
       pendingFinalize = false;
       stopCurrentPlayback("clear");
+      stopInterruptionEvalTick();
+      closeDeepgram();
       resetUserSpeechState("clear_btn");
       stopTimer();
 
@@ -1980,6 +2472,9 @@
       messages = [];
       currentTurnId = null;
       activeAssistantMessageId = null;
+      activeUserMessageId = null;
+      activeUserMessageText = "";
+      activeUserMessageTurnSeq = 0;
       conversationMode = "chat";
       storyAutoContinueCount = 0;
       resetTranscriptTurnBuffer();
