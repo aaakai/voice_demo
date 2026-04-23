@@ -1,0 +1,931 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voice Interrupt Demo</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --ink: #18212f;
+      --muted: #657084;
+      --line: #d9dee7;
+      --brand: #165dff;
+      --brand-soft: #e8f0ff;
+      --user: #eef7f1;
+      --assistant: #f6f7fb;
+      --danger: #d64545;
+      --ok: #167a4a;
+      --warn: #9b6400;
+      --shadow: 0 18px 50px rgba(24, 33, 47, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      overflow: hidden;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.68), rgba(255,255,255,0)),
+        var(--bg);
+    }
+
+    button {
+      font: inherit;
+    }
+
+    .shell {
+      width: min(1180px, calc(100vw - 32px));
+      height: calc(100vh - 56px);
+      margin: 28px auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 320px;
+      gap: 18px;
+      min-height: 0;
+    }
+
+    .console {
+      height: 100%;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr) auto;
+      overflow: hidden;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+    }
+
+    .topbar {
+      padding: 18px 20px 14px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+    }
+
+    .title h1 {
+      margin: 0;
+      font-size: 19px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    .title p {
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .state-pill {
+      padding: 7px 10px;
+      border-radius: 999px;
+      background: var(--brand-soft);
+      color: var(--brand);
+      font-size: 13px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .scenario-bar {
+      display: flex;
+      gap: 8px;
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--line);
+      flex-wrap: wrap;
+    }
+
+    .scenario-bar button,
+    .controls button {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--ink);
+      border-radius: 8px;
+      padding: 8px 11px;
+      cursor: pointer;
+    }
+
+    .scenario-bar button:hover,
+    .controls button:hover {
+      border-color: #9eb5ff;
+    }
+
+    .scenario-bar button.active,
+    .controls button.primary {
+      background: var(--brand);
+      border-color: var(--brand);
+      color: #fff;
+    }
+
+    .timeline {
+      min-height: 0;
+      padding: 18px 20px;
+      overflow-y: auto;
+      background:
+        linear-gradient(180deg, rgba(248,250,252,0.8), rgba(255,255,255,0));
+    }
+
+    .message {
+      max-width: 76%;
+      margin: 0 0 14px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--assistant);
+    }
+
+    .message.user {
+      margin-left: auto;
+      background: var(--user);
+      border-color: #cde6d4;
+    }
+
+    .message.interrupted {
+      border-color: rgba(214, 69, 69, 0.45);
+      background: #fff5f5;
+    }
+
+    .meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+
+    .text {
+      white-space: pre-wrap;
+      line-height: 1.55;
+      font-size: 15px;
+    }
+
+    .controls {
+      border-top: 1px solid var(--line);
+      padding: 14px 20px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 14px;
+      align-items: center;
+    }
+
+    .live {
+      min-height: 42px;
+      max-height: 72px;
+      overflow-y: auto;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 9px 11px;
+      color: var(--muted);
+      background: #fbfcfe;
+      line-height: 1.45;
+    }
+
+    .live strong {
+      color: var(--ink);
+      overflow-wrap: anywhere;
+    }
+
+    .actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    aside {
+      height: 100%;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: minmax(260px, auto) minmax(0, 1fr);
+      gap: 18px;
+    }
+
+    .panel {
+      min-height: 0;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel h2 {
+      margin: 0;
+      padding: 14px 15px;
+      font-size: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .kv {
+      padding: 12px 15px;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+      font-size: 13px;
+      max-height: 260px;
+      overflow-y: auto;
+    }
+
+    .kv div {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      border-bottom: 1px dashed #e8ebf1;
+      padding-bottom: 7px;
+      min-width: 0;
+    }
+
+    .kv span:first-child {
+      color: var(--muted);
+      flex: 0 0 auto;
+    }
+
+    .kv strong {
+      min-width: 0;
+      max-width: 180px;
+      overflow: hidden;
+      text-align: right;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .agent-lanes {
+      padding: 12px 15px 0;
+      display: grid;
+      gap: 9px;
+    }
+
+    .agent-lane {
+      border: 1px solid #e5e9f1;
+      border-radius: 10px;
+      padding: 9px 10px;
+      background: #fbfcfe;
+      display: grid;
+      gap: 6px;
+    }
+
+    .agent-lane.active {
+      border-color: #9eb5ff;
+      background: #f4f8ff;
+    }
+
+    .agent-lane.warn {
+      border-color: rgba(155, 100, 0, 0.34);
+      background: #fffaf0;
+    }
+
+    .agent-lane.danger {
+      border-color: rgba(214, 69, 69, 0.34);
+      background: #fff5f5;
+    }
+
+    .agent-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .agent-status {
+      color: var(--muted);
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .agent-detail {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .log {
+      height: 100%;
+      min-height: 0;
+      padding: 12px 15px;
+      overflow-y: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #3c4658;
+      background: #fbfcfe;
+    }
+
+    .log-row {
+      border-bottom: 1px solid #eef1f6;
+      padding: 6px 0;
+    }
+
+    @media (max-width: 880px) {
+      body {
+        overflow: auto;
+      }
+
+      .shell {
+        grid-template-columns: 1fr;
+        height: auto;
+      }
+
+      .console,
+      aside {
+        min-height: auto;
+        height: auto;
+      }
+
+      .controls {
+        grid-template-columns: 1fr;
+      }
+
+      .actions {
+        justify-content: flex-start;
+      }
+
+      .message {
+        max-width: 92%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="console">
+      <header class="topbar">
+        <div class="title">
+          <h1>Voice Interrupt Demo</h1>
+          <p>Mock ASR + parallel dialogue/interrupt state machine</p>
+        </div>
+        <div id="statePill" class="state-pill">idle</div>
+      </header>
+
+      <nav class="scenario-bar" aria-label="Scenario selector">
+        <button data-scenario="a" class="active">A 正常对话</button>
+        <button data-scenario="b">B 停顿短接话</button>
+        <button data-scenario="c">C 用户打断</button>
+        <button data-scenario="all">All</button>
+      </nav>
+
+      <section id="timeline" class="timeline" aria-live="polite"></section>
+
+      <footer class="controls">
+        <div id="liveTranscript" class="live">Live transcript: <strong>等待开始</strong></div>
+        <div class="actions">
+          <button id="startBtn" class="primary">Start</button>
+          <button id="stopBtn">Stop</button>
+          <button id="bargeBtn">Simulate Interrupt</button>
+          <button id="clearBtn">Clear</button>
+        </div>
+      </footer>
+    </section>
+
+    <aside>
+      <section class="panel">
+        <h2>State</h2>
+        <div id="agentLanes" class="agent-lanes"></div>
+        <div id="debug" class="kv"></div>
+      </section>
+      <section class="panel">
+        <h2>Event Log</h2>
+        <div id="log" class="log"></div>
+      </section>
+    </aside>
+  </main>
+
+  <script>
+    const scenarios = {
+      a: [
+        [200, "user_speech_started", "turn-a", {}],
+        [180, "partial_transcript", "turn-a", { text: "请你做个" }],
+        [220, "partial_transcript", "turn-a", { text: "请你做个自我介绍" }],
+        [260, "final_transcript", "turn-a", { text: "请你做个自我介绍" }],
+        [80, "user_speech_stopped", "turn-a", {}],
+      ],
+      b: [
+        [240, "user_speech_started", "turn-b", {}],
+        [180, "partial_transcript", "turn-b", { text: "我想了解一下" }],
+        [900, "partial_transcript", "turn-b", { text: "我想了解一下这个系统怎么做到并行" }],
+        [380, "partial_transcript", "turn-b", { text: "我想了解一下这个系统怎么做到并行处理语音" }],
+        [260, "final_transcript", "turn-b", { text: "我想了解一下这个系统怎么做到并行处理语音" }],
+        [100, "user_speech_stopped", "turn-b", {}],
+      ],
+      c: [
+        [260, "user_speech_started", "turn-c", {}],
+        [180, "partial_transcript", "turn-c", { text: "请你详细讲讲" }],
+        [200, "final_transcript", "turn-c", { text: "请你详细讲讲这个系统" }],
+        [80, "user_speech_stopped", "turn-c", {}],
+        [760, "user_speech_started", "turn-c2", {}],
+        [160, "partial_transcript", "turn-c2", { text: "等等我换个问题" }],
+        [220, "final_transcript", "turn-c2", { text: "等等我换个问题，怎么快速接入" }],
+        [80, "user_speech_stopped", "turn-c2", {}],
+      ],
+    };
+
+    const context = {
+      state: "idle",
+      running: false,
+      selectedScenario: "a",
+      userSpeaking: false,
+      assistantSpeaking: false,
+      currentTurnId: "",
+      activeTtsTurnId: "",
+      latestPartial: "",
+      latestFinal: "",
+      responseDraft: "",
+      currentResponseText: "",
+      lastPartialAt: 0,
+      cooldownUntil: 0,
+      seenBackchannelTurns: new Set(),
+      timers: [],
+      messages: [],
+      activeAssistantMessageId: "",
+      inputFinished: false,
+      pendingReply: null,
+      agents: {
+        main: { status: "idle", detail: "等待 final transcript" },
+        interrupt: { status: "watching", detail: "监听 partial 和停顿" },
+        playback: { status: "idle", detail: "等待播报任务" },
+      },
+    };
+
+    const timelineEl = document.getElementById("timeline");
+    const liveEl = document.getElementById("liveTranscript");
+    const statePillEl = document.getElementById("statePill");
+    const agentLanesEl = document.getElementById("agentLanes");
+    const debugEl = document.getElementById("debug");
+    const logEl = document.getElementById("log");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const bargeBtn = document.getElementById("bargeBtn");
+    const clearBtn = document.getElementById("clearBtn");
+
+    let interruptTimer = null;
+    let speakingTimer = null;
+    let currentUtterance = null;
+    let messageSeq = 0;
+
+    function nowLabel() {
+      return new Date().toLocaleTimeString("zh-CN", { hour12: false });
+    }
+
+    function log(tag, data = {}) {
+      const row = document.createElement("div");
+      row.className = "log-row";
+      row.textContent = `${nowLabel()} ${tag} ${JSON.stringify(data)}`;
+      logEl.prepend(row);
+      while (logEl.children.length > 120) logEl.removeChild(logEl.lastChild);
+      console.log(tag, data);
+    }
+
+    function setState(next, reason) {
+      if (context.state === next) return;
+      const prev = context.state;
+      context.state = next;
+      statePillEl.textContent = next;
+      log("[STATE]", { prev, next, reason });
+      renderDebug();
+    }
+
+    function setAgent(name, status, detail = "") {
+      context.agents[name] = { status, detail };
+      renderAgentLanes();
+      renderDebug();
+    }
+
+    function addMessage(role, text, status = "done") {
+      const msg = {
+        id: `m-${++messageSeq}`,
+        role,
+        text,
+        status,
+        time: nowLabel(),
+      };
+      context.messages.push(msg);
+      renderMessages();
+      return msg.id;
+    }
+
+    function updateMessage(id, patch) {
+      const msg = context.messages.find((item) => item.id === id);
+      if (!msg) return;
+      Object.assign(msg, patch);
+      renderMessages();
+    }
+
+    function renderMessages() {
+      timelineEl.innerHTML = "";
+      for (const msg of context.messages) {
+        const node = document.createElement("article");
+        node.className = `message ${msg.role} ${msg.status === "interrupted" ? "interrupted" : ""}`;
+        node.innerHTML = `
+          <div class="meta">
+            <span>${msg.role === "user" ? "User" : "Assistant"}</span>
+            <span>${msg.status} · ${msg.time}</span>
+          </div>
+          <div class="text">${escapeHtml(msg.text || "")}</div>
+        `;
+        timelineEl.appendChild(node);
+      }
+      timelineEl.scrollTop = timelineEl.scrollHeight;
+    }
+
+    function renderAgentLanes() {
+      const lanes = [
+        {
+          key: "main",
+          title: "主 Agent",
+          subtitle: "ASR final -> reply planning",
+        },
+        {
+          key: "interrupt",
+          title: "打断子 Agent",
+          subtitle: "partial/pause -> backchannel or barge-in",
+        },
+        {
+          key: "playback",
+          title: "播放控制器",
+          subtitle: "TTS start/stop",
+        },
+      ];
+      agentLanesEl.innerHTML = lanes.map((lane) => {
+        const agent = context.agents[lane.key];
+        const level = laneClass(agent.status);
+        return `
+          <div class="agent-lane ${level}">
+            <div class="agent-head">
+              <span>${lane.title}</span>
+              <span class="agent-status">${escapeHtml(agent.status)}</span>
+            </div>
+            <div class="agent-detail">${escapeHtml(agent.detail || lane.subtitle)}</div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function laneClass(status) {
+      if (["drafting", "thinking", "speaking", "backchannel"].includes(status)) return "active";
+      if (["watching", "queued", "evaluating"].includes(status)) return "warn";
+      if (["interrupted", "barge-in", "stopped"].includes(status)) return "danger";
+      return "";
+    }
+
+    function renderDebug() {
+      const pauseMs = context.lastPartialAt ? Date.now() - context.lastPartialAt : 0;
+      const rows = {
+        state: context.state,
+        userSpeaking: context.userSpeaking,
+        assistantSpeaking: context.assistantSpeaking,
+        mainAgent: context.agents.main.status,
+        interruptAgent: context.agents.interrupt.status,
+        playbackAgent: context.agents.playback.status,
+        currentTurnId: context.currentTurnId || "-",
+        latestPartial: context.latestPartial || "-",
+        latestFinal: context.latestFinal || "-",
+        draft: context.responseDraft || "-",
+        pendingReply: context.pendingReply ? context.pendingReply[0] : "-",
+        pauseMs,
+        cooldown: Date.now() < context.cooldownUntil,
+        activeTtsTurnId: context.activeTtsTurnId || "-",
+      };
+      debugEl.innerHTML = Object.entries(rows)
+        .map(([key, value]) => `<div><span>${key}</span><strong>${escapeHtml(String(value))}</strong></div>`)
+        .join("");
+      renderAgentLanes();
+    }
+
+    function escapeHtml(value) {
+      return value
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    function mockDraft(text) {
+      const t = text.trim();
+      if (t.length < 4) return "";
+      return `我在听，你可能想问：${t.slice(0, 16)}`;
+    }
+
+    function mockReply(text) {
+      if (text.includes("自我介绍")) {
+        return "你好，我是一个用于验证主动打断架构的语音助手 demo。我支持并行草拟回复、打断判断，以及被用户插话时立刻停播重规划。";
+      }
+      if (text.includes("并行") || text.includes("系统")) {
+        return "这个 demo 的核心是事件驱动状态机。主回复链路负责理解和生成内容，打断链路并行监控语音状态，一旦检测到插话就立即发出停播和重规划信号。";
+      }
+      if (text.includes("接入")) {
+        return "你可以先用 mock ASR 跑通全链路，再把 ASR、LLM、TTS 分别替换成真实服务。因为模块边界已经隔离，替换成本会比较低。";
+      }
+      return `收到，你说的是：${text}。我会先基于 partial 草拟，再在 final 到达后给你完整回复。`;
+    }
+
+    function dispatch(type, turnId, payload = {}) {
+      if (!context.running && type !== "input_finished") return;
+      const event = { type, turnId, payload, timestamp: Date.now() };
+      handleEvent(event);
+    }
+
+    function handleEvent(event) {
+      switch (event.type) {
+        case "user_speech_started":
+          onUserSpeechStarted(event);
+          break;
+        case "user_speech_stopped":
+          onUserSpeechStopped(event);
+          break;
+        case "partial_transcript":
+          onPartial(event);
+          break;
+        case "final_transcript":
+          onFinal(event);
+          break;
+        case "input_finished":
+          context.inputFinished = true;
+          log("[INPUT FINISHED]");
+          break;
+      }
+      renderDebug();
+    }
+
+    function onUserSpeechStarted(event) {
+      context.currentTurnId = event.turnId;
+      context.userSpeaking = true;
+      context.latestPartial = "";
+      context.latestFinal = "";
+      liveEl.innerHTML = "Live transcript: <strong>...</strong>";
+      log("[TURN START]", { turnId: event.turnId });
+      setAgent("main", "listening", `等待 ${event.turnId} 的 final transcript`);
+      setAgent("interrupt", "watching", "用户开始说话，监听 partial 和停顿");
+
+      if (context.assistantSpeaking) {
+        interruptCurrentTurn("user_started_while_assistant_speaking");
+      }
+      setState("listening", "user_speech_started");
+    }
+
+    function onUserSpeechStopped(event) {
+      context.userSpeaking = false;
+      log("[ASR speech stopped]", { turnId: event.turnId });
+      setAgent("interrupt", "idle", "用户停止说话，等待下一轮 partial");
+      maybeSpeakPending();
+    }
+
+    function onPartial(event) {
+      const text = (event.payload.text || "").trim();
+      if (!text) return;
+      context.currentTurnId = event.turnId;
+      context.latestPartial = text;
+      context.lastPartialAt = Date.now();
+      liveEl.innerHTML = `Live transcript: <strong>${escapeHtml(text)}</strong>`;
+      log("[ASR partial]", { turnId: event.turnId, text });
+
+      const draft = mockDraft(text);
+      if (draft) {
+        context.responseDraft = draft;
+        setAgent("main", "drafting", draft);
+        log("[Dialogue draft update]", { turnId: event.turnId, draft });
+      }
+      setAgent("interrupt", "evaluating", `partial=${text.slice(0, 28)}`);
+      evaluateInterrupt();
+    }
+
+    function onFinal(event) {
+      const text = (event.payload.text || "").trim();
+      if (!text) return;
+      context.latestFinal = text;
+      liveEl.innerHTML = `Live transcript: <strong>${escapeHtml(text)}</strong>`;
+      addMessage("user", text);
+      log("[ASR final]", { turnId: event.turnId, text });
+      setState("thinking", "final_transcript");
+      setAgent("main", "thinking", "final transcript 到达，生成完整回复");
+
+      window.setTimeout(() => {
+        const reply = mockReply(text);
+        context.currentResponseText = reply;
+        log("[Dialogue final reply]", { turnId: event.turnId, reply });
+        setAgent("main", "reply-ready", reply);
+        startAssistantReply(event.turnId, reply);
+      }, 180);
+    }
+
+    function evaluateInterrupt() {
+      const pauseMs = context.lastPartialAt ? Date.now() - context.lastPartialAt : 0;
+      if (context.assistantSpeaking && context.userSpeaking && context.latestPartial.length >= 2) {
+        setAgent("interrupt", "barge-in", "用户在 assistant 播报时插话");
+        interruptCurrentTurn("user_barge_in");
+        return;
+      }
+      if (!context.userSpeaking) return;
+      if (context.assistantSpeaking) return;
+      if (Date.now() < context.cooldownUntil) return;
+      if (context.latestPartial.length < 6) return;
+      if (context.seenBackchannelTurns.has(context.currentTurnId)) return;
+
+      window.setTimeout(() => {
+        const delayedPauseMs = Date.now() - context.lastPartialAt;
+        if (!context.userSpeaking) return;
+        if (context.assistantSpeaking) return;
+        if (context.seenBackchannelTurns.has(context.currentTurnId)) return;
+        if (delayedPauseMs < 450 || delayedPauseMs > 1300) return;
+        triggerBackchannel();
+      }, 480);
+    }
+
+    function triggerBackchannel() {
+      const candidates = ["嗯，我在听。", "好的，你继续。", "明白，接着说。"];
+      const text = candidates[Math.floor(Math.random() * candidates.length)];
+      context.seenBackchannelTurns.add(context.currentTurnId);
+      context.cooldownUntil = Date.now() + 2800;
+      setAgent("interrupt", "backchannel", text);
+      log("[Interrupt approved]", {
+        action: "backchannel",
+        turnId: context.currentTurnId,
+        text,
+      });
+      speak(`${context.currentTurnId}-bc`, text, { backchannel: true });
+    }
+
+    function startAssistantReply(turnId, reply) {
+      context.activeAssistantMessageId = addMessage("assistant", reply, "speaking");
+      if (context.userSpeaking) {
+        context.pendingReply = [turnId, reply];
+        setAgent("main", "queued", "用户仍在说话，完整回复暂存");
+        log("[Replan requested]", { turnId, reason: "user_still_speaking" });
+        setState("replanning", "user_still_speaking");
+        return;
+      }
+      speak(turnId, reply);
+    }
+
+    function maybeSpeakPending() {
+      if (!context.pendingReply || context.assistantSpeaking || context.userSpeaking) return;
+      const [turnId, reply] = context.pendingReply;
+      context.pendingReply = null;
+      setAgent("main", "reply-ready", "用户停顿后释放暂存回复");
+      speak(turnId, reply);
+    }
+
+    function speak(turnId, text, options = {}) {
+      stopSpeechOnly("preempt");
+      context.assistantSpeaking = true;
+      context.activeTtsTurnId = turnId;
+      setAgent("playback", options.backchannel ? "backchannel" : "speaking", text);
+      log("[TTS START]", { turnId, text });
+      setState("speaking", "tts_started");
+
+      if ("speechSynthesis" in window) {
+        currentUtterance = new SpeechSynthesisUtterance(text);
+        currentUtterance.lang = "zh-CN";
+        currentUtterance.rate = 1.04;
+        currentUtterance.onend = () => finishSpeak(turnId, false, options);
+        currentUtterance.onerror = () => finishSpeak(turnId, true, options);
+        speechSynthesis.speak(currentUtterance);
+      } else {
+        const duration = Math.max(800, text.length * 115);
+        speakingTimer = window.setTimeout(() => finishSpeak(turnId, false, options), duration);
+      }
+    }
+
+    function finishSpeak(turnId, interrupted, options = {}) {
+      if (context.activeTtsTurnId !== turnId) return;
+      context.assistantSpeaking = false;
+      context.activeTtsTurnId = "";
+      currentUtterance = null;
+      if (speakingTimer) {
+        clearTimeout(speakingTimer);
+        speakingTimer = null;
+      }
+      log("[TTS FINISHED]", { turnId, interrupted });
+      setAgent("playback", interrupted ? "stopped" : "idle", interrupted ? "播报被中断" : "播报完成");
+      if (!options.backchannel && context.activeAssistantMessageId) {
+        updateMessage(context.activeAssistantMessageId, { status: interrupted ? "interrupted" : "done" });
+      }
+      if (interrupted) {
+        setState("replanning", "tts_interrupted");
+      } else if (context.userSpeaking) {
+        setState("listening", "tts_done_user_speaking");
+      } else {
+        setState("idle", "tts_done");
+      }
+      maybeSpeakPending();
+      renderDebug();
+    }
+
+    function interruptCurrentTurn(reason) {
+      log("[INTERRUPT]", { reason, turnId: context.activeTtsTurnId || context.currentTurnId });
+      setAgent("interrupt", "barge-in", reason);
+      setAgent("playback", "stopped", "收到 interruptCurrentTurn");
+      stopSpeechOnly(reason);
+      if (context.activeAssistantMessageId) {
+        updateMessage(context.activeAssistantMessageId, { status: "interrupted" });
+      }
+      setState("interrupted", reason);
+      context.assistantSpeaking = false;
+      context.activeTtsTurnId = "";
+      setState("replanning", `interrupt:${reason}`);
+    }
+
+    function stopSpeechOnly(reason) {
+      if (speakingTimer) {
+        clearTimeout(speakingTimer);
+        speakingTimer = null;
+      }
+      if ("speechSynthesis" in window) {
+        speechSynthesis.cancel();
+      }
+      if (context.assistantSpeaking) {
+        setAgent("playback", "stopped", reason);
+        log("[STOP TTS]", { reason, turnId: context.activeTtsTurnId });
+      }
+    }
+
+    function runScenario(name) {
+      stopAll(false);
+      context.running = true;
+      context.selectedScenario = name;
+      context.inputFinished = false;
+      setAgent("main", "idle", "等待 ASR final");
+      setAgent("interrupt", "watching", "监听 partial 和停顿");
+      setAgent("playback", "idle", "等待播报任务");
+      setState("listening", "scenario_start");
+      const script = name === "all"
+        ? [...scenarios.a, [2100, "user_speech_started", "turn-b", {}], ...scenarios.b.slice(1), [2000, "user_speech_started", "turn-c", {}], ...scenarios.c.slice(1)]
+        : scenarios[name];
+
+      let elapsed = 0;
+      for (const [delay, type, turnId, payload] of script) {
+        elapsed += delay;
+        const timer = window.setTimeout(() => dispatch(type, turnId, payload), elapsed);
+        context.timers.push(timer);
+      }
+      context.timers.push(window.setTimeout(() => dispatch("input_finished", "system", {}), elapsed + 250));
+      log("[INPUT START]", { scenario: name });
+      interruptTimer = window.setInterval(() => {
+        evaluateInterrupt();
+        renderDebug();
+      }, 250);
+    }
+
+    function stopAll(clearMessages = false) {
+      context.running = false;
+      for (const timer of context.timers) clearTimeout(timer);
+      context.timers = [];
+      if (interruptTimer) {
+        clearInterval(interruptTimer);
+        interruptTimer = null;
+      }
+      stopSpeechOnly("stop_all");
+      context.userSpeaking = false;
+      context.assistantSpeaking = false;
+      context.activeTtsTurnId = "";
+      context.pendingReply = null;
+      setAgent("main", "idle", "已停止");
+      setAgent("interrupt", "idle", "已停止");
+      setAgent("playback", "idle", "已停止");
+      liveEl.innerHTML = "Live transcript: <strong>等待开始</strong>";
+      if (clearMessages) {
+        context.messages = [];
+        context.activeAssistantMessageId = "";
+        logEl.innerHTML = "";
+        renderMessages();
+      }
+      setState("idle", "stop_all");
+      renderDebug();
+    }
+
+    document.querySelectorAll(".scenario-bar button").forEach((button) => {
+      button.addEventListener("click", () => {
+        document.querySelectorAll(".scenario-bar button").forEach((item) => item.classList.remove("active"));
+        button.classList.add("active");
+        context.selectedScenario = button.dataset.scenario;
+        renderDebug();
+      });
+    });
+
+    startBtn.addEventListener("click", () => runScenario(context.selectedScenario));
+    stopBtn.addEventListener("click", () => stopAll(false));
+    clearBtn.addEventListener("click", () => stopAll(true));
+    bargeBtn.addEventListener("click", () => {
+      const turn = `manual-${Date.now()}`;
+      dispatch("user_speech_started", turn, {});
+      window.setTimeout(() => dispatch("partial_transcript", turn, { text: "等等我想换个说法" }), 120);
+      window.setTimeout(() => dispatch("final_transcript", turn, { text: "等等我想换个说法" }), 360);
+      window.setTimeout(() => dispatch("user_speech_stopped", turn, {}), 430);
+    });
+
+    renderMessages();
+    renderDebug();
+  </script>
+</body>
+</html>

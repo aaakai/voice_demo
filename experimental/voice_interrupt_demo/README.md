@@ -80,6 +80,29 @@ experimental/voice_interrupt_demo/
 
 ## 运行
 
+### 浏览器测试页
+
+可以直接打开：
+
+```text
+/Users/sunjingkai/Desktop/agentic/experimental/voice_interrupt_demo/web_demo.html
+```
+
+也可以用静态服务器打开：
+
+```bash
+cd /Users/sunjingkai/Desktop/agentic/experimental/voice_interrupt_demo
+python3 -m http.server 8765
+```
+
+然后访问：
+
+```text
+http://127.0.0.1:8765/web_demo.html
+```
+
+这个页面使用浏览器内 mock ASR 和 `speechSynthesis`，用于观察 partial、draft、backchannel、用户打断 assistant、状态切换和事件日志。
+
 ### 1) 安装依赖
 
 ```bash
