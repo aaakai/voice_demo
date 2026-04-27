@@ -38,6 +38,7 @@ class PlaybackController:
     async def stop(self, reason: str, emit: EmitFn) -> None:
         if not self.is_playing():
             return
+        turn_id = self._current_turn_id
         self._stop_event.set()
         task = self._current_task
         if task:
@@ -45,7 +46,7 @@ class PlaybackController:
                 await task
             except asyncio.CancelledError:
                 pass
-        logger.info("[PCM STOP] turn=%s reason=%s", self._current_turn_id, reason)
+        logger.info("[PCM STOP] turn=%s reason=%s", turn_id, reason)
 
     async def _run(self, turn_id: str, text: str, emit: EmitFn) -> None:
         await emit(self.event_factory.make(EventType.TTS_STARTED, turn_id, {"text": text}))

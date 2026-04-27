@@ -1,15 +1,5 @@
 from __future__ import annotations
 
-import time
+from utils.clocks import elapsed_ms, now_ms, now_ts
 
-
-def now_ts() -> float:
-    return time.time()
-
-
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def elapsed_ms(since_ts: float) -> int:
-    return int((time.time() - since_ts) * 1000)
+__all__ = ["now_ts", "now_ms", "elapsed_ms"]

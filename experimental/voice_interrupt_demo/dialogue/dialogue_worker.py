@@ -62,13 +62,26 @@ class DialogueWorker:
 
     async def _handle_partial(self, item: DialogueInput, emit: EmitFn) -> None:
         draft = await self.engine.generate_draft(item.text, self.context)
-        if not draft:
+        if not draft.intent_hypothesis:
             return
-        logger.info("[Dialogue draft update] turn=%s draft=%s", item.turn_id, draft)
-        event = self.event_factory.make(
-            EventType.RESPONSE_DRAFT_UPDATED,
+        logger.info(
+            "[Intent hypothesis updated] turn=%s intent=%s confidence=%.2f missing=%s",
             item.turn_id,
-            {"draft": draft},
+            draft.intent_hypothesis,
+            draft.intent_confidence,
+            ",".join(draft.missing_slots) or "-",
+        )
+        logger.info(
+            "[Dialogue draft updated] turn=%s short=%s clarify=%s rough_full=%s",
+            item.turn_id,
+            draft.short_reply_candidate,
+            draft.clarification_candidate,
+            draft.rough_full_reply_candidate,
+        )
+        event = self.event_factory.make(
+            EventType.DIALOGUE_DRAFT_UPDATED,
+            item.turn_id,
+            {"draft": draft.to_dict()},
         )
         await emit(event)
 

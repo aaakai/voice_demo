@@ -364,15 +364,17 @@
       <header class="topbar">
         <div class="title">
           <h1>Voice Interrupt Demo</h1>
-          <p>Mock ASR + parallel dialogue/interrupt state machine</p>
+          <p>Mock ASR + dialogue pipeline + floor-taking policy</p>
         </div>
         <div id="statePill" class="state-pill">idle</div>
       </header>
 
       <nav class="scenario-bar" aria-label="Scenario selector">
-        <button data-scenario="a" class="active">A 正常对话</button>
-        <button data-scenario="b">B 停顿短接话</button>
-        <button data-scenario="c">C 用户打断</button>
+        <button data-scenario="1" class="active">1 正常问答</button>
+        <button data-scenario="2">2 提前短答</button>
+        <button data-scenario="3">3 用户打断</button>
+        <button data-scenario="4">4 主动追问</button>
+        <button data-scenario="5">5 纠偏抢话</button>
         <button data-scenario="all">All</button>
       </nav>
 
@@ -403,57 +405,90 @@
   </main>
 
   <script>
+    const settings = {
+      floorPolicyPollMs: 100,
+      softTakeFloorPauseMs: 450,
+      hardTakeFloorPauseMs: 350,
+      clarifyPauseMs: 420,
+      backchannelPauseMinMs: 450,
+      backchannelPauseMaxMs: 1200,
+      backchannelMinConfidence: 0.45,
+      softTakeFloorMinConfidence: 0.72,
+      proactiveCooldownMs: 2400,
+      bargeInTextMinLen: 2,
+    };
+
     const scenarios = {
-      a: [
-        [200, "user_speech_started", "turn-a", {}],
-        [180, "partial_transcript", "turn-a", { text: "请你做个" }],
-        [220, "partial_transcript", "turn-a", { text: "请你做个自我介绍" }],
-        [260, "final_transcript", "turn-a", { text: "请你做个自我介绍" }],
-        [80, "user_speech_stopped", "turn-a", {}],
+      1: [
+        [200, "user_speech_started", "s1-normal", {}],
+        [220, "partial_transcript", "s1-normal", { text: "请你做个" }],
+        [260, "partial_transcript", "s1-normal", { text: "请你做个自我介绍" }],
+        [360, "final_transcript", "s1-normal", { text: "请你做个自我介绍" }],
+        [80, "user_speech_stopped", "s1-normal", {}],
       ],
-      b: [
-        [240, "user_speech_started", "turn-b", {}],
-        [180, "partial_transcript", "turn-b", { text: "我想了解一下" }],
-        [900, "partial_transcript", "turn-b", { text: "我想了解一下这个系统怎么做到并行" }],
-        [380, "partial_transcript", "turn-b", { text: "我想了解一下这个系统怎么做到并行处理语音" }],
-        [260, "final_transcript", "turn-b", { text: "我想了解一下这个系统怎么做到并行处理语音" }],
-        [100, "user_speech_stopped", "turn-b", {}],
+      2: [
+        [200, "user_speech_started", "s2-pause", {}],
+        [220, "partial_transcript", "s2-pause", { text: "我想问一下" }],
+        [260, "partial_transcript", "s2-pause", { text: "我想问一下北京明天的天气" }],
+        [1200, "partial_transcript", "s2-pause", { text: "我想问一下北京明天的天气还有出门建议" }],
+        [420, "final_transcript", "s2-pause", { text: "我想问一下北京明天的天气还有出门建议" }],
+        [80, "user_speech_stopped", "s2-pause", {}],
       ],
-      c: [
-        [260, "user_speech_started", "turn-c", {}],
-        [180, "partial_transcript", "turn-c", { text: "请你详细讲讲" }],
-        [200, "final_transcript", "turn-c", { text: "请你详细讲讲这个系统" }],
-        [80, "user_speech_stopped", "turn-c", {}],
-        [760, "user_speech_started", "turn-c2", {}],
-        [160, "partial_transcript", "turn-c2", { text: "等等我换个问题" }],
-        [220, "final_transcript", "turn-c2", { text: "等等我换个问题，怎么快速接入" }],
-        [80, "user_speech_stopped", "turn-c2", {}],
+      3: [
+        [180, "user_speech_started", "s3-first", {}],
+        [180, "partial_transcript", "s3-first", { text: "请你详细讲讲这个系统" }],
+        [220, "final_transcript", "s3-first", { text: "请你详细讲讲这个系统" }],
+        [80, "user_speech_stopped", "s3-first", {}],
+        [900, "user_speech_started", "s3-barge", {}],
+        [120, "partial_transcript", "s3-barge", { text: "等等" }],
+        [180, "partial_transcript", "s3-barge", { text: "等等我换个问题" }],
+        [220, "final_transcript", "s3-barge", { text: "等等我换个问题，怎么快速接入真实语音" }],
+        [80, "user_speech_stopped", "s3-barge", {}],
+      ],
+      4: [
+        [200, "user_speech_started", "s4-clarify", {}],
+        [220, "partial_transcript", "s4-clarify", { text: "我想问天气" }],
+        [1000, "partial_transcript", "s4-clarify", { text: "我想问天气大概怎么样" }],
+        [520, "final_transcript", "s4-clarify", { text: "我想问天气大概怎么样" }],
+        [80, "user_speech_stopped", "s4-clarify", {}],
+      ],
+      5: [
+        [200, "user_speech_started", "s5-correct", {}],
+        [180, "partial_transcript", "s5-correct", { text: "不是北京" }],
+        [560, "partial_transcript", "s5-correct", { text: "不是北京，不对，是上海明天的天气" }],
+        [420, "final_transcript", "s5-correct", { text: "不是北京，不对，是上海明天的天气" }],
+        [80, "user_speech_stopped", "s5-correct", {}],
       ],
     };
 
     const context = {
       state: "idle",
       running: false,
-      selectedScenario: "a",
+      selectedScenario: "1",
       userSpeaking: false,
       assistantSpeaking: false,
+      floorOwner: "none",
       currentTurnId: "",
       activeTtsTurnId: "",
       latestPartial: "",
       latestFinal: "",
+      currentDraft: emptyDraft(),
       responseDraft: "",
       currentResponseText: "",
       lastPartialAt: 0,
       cooldownUntil: 0,
       seenBackchannelTurns: new Set(),
+      takenFloorTurns: new Set(),
       timers: [],
       messages: [],
       activeAssistantMessageId: "",
       inputFinished: false,
       pendingReply: null,
+      lastFloorDecision: emptyDecision("init"),
+      lastDecisionKey: "",
       agents: {
         main: { status: "idle", detail: "等待 final transcript" },
-        interrupt: { status: "watching", detail: "监听 partial 和停顿" },
+        interrupt: { status: "watching", detail: "监听 partial、停顿和纠正词" },
         playback: { status: "idle", detail: "等待播报任务" },
       },
     };
@@ -573,9 +608,9 @@
     }
 
     function laneClass(status) {
-      if (["drafting", "thinking", "speaking", "backchannel"].includes(status)) return "active";
-      if (["watching", "queued", "evaluating"].includes(status)) return "warn";
-      if (["interrupted", "barge-in", "stopped"].includes(status)) return "danger";
+      if (["drafting", "thinking", "speaking", "backchannel", "soft_take_floor", "hard_take_floor"].includes(status)) return "active";
+      if (["watching", "queued", "evaluating", "reply-ready"].includes(status)) return "warn";
+      if (["interrupted", "barge-in", "stopped", "stop_assistant"].includes(status)) return "danger";
       return "";
     }
 
@@ -583,6 +618,7 @@
       const pauseMs = context.lastPartialAt ? Date.now() - context.lastPartialAt : 0;
       const rows = {
         state: context.state,
+        floorOwner: context.floorOwner,
         userSpeaking: context.userSpeaking,
         assistantSpeaking: context.assistantSpeaking,
         mainAgent: context.agents.main.status,
@@ -591,6 +627,11 @@
         currentTurnId: context.currentTurnId || "-",
         latestPartial: context.latestPartial || "-",
         latestFinal: context.latestFinal || "-",
+        intent: context.currentDraft.intentHypothesis || "-",
+        confidence: context.currentDraft.intentConfidence.toFixed(2),
+        candidateType: context.lastFloorDecision.candidateType || "-",
+        decision: context.lastFloorDecision.action || "-",
+        reason: context.lastFloorDecision.reason || "-",
         draft: context.responseDraft || "-",
         pendingReply: context.pendingReply ? context.pendingReply[0] : "-",
         pauseMs,
@@ -611,23 +652,125 @@
         .replaceAll('"', "&quot;");
     }
 
-    function mockDraft(text) {
-      const t = text.trim();
-      if (t.length < 4) return "";
-      return `我在听，你可能想问：${t.slice(0, 16)}`;
+    function emptyDraft() {
+      return {
+        intentHypothesis: "",
+        intentConfidence: 0,
+        shortReplyCandidate: "",
+        clarificationCandidate: "",
+        roughFullReplyCandidate: "",
+        missingSlots: [],
+        isCorrection: false,
+      };
     }
 
-    function mockReply(text) {
-      if (text.includes("自我介绍")) {
-        return "你好，我是一个用于验证主动打断架构的语音助手 demo。我支持并行草拟回复、打断判断，以及被用户插话时立刻停播重规划。";
+    function emptyDecision(reason = "keep_listening") {
+      return {
+        action: "no_interrupt",
+        reason,
+        confidence: 0,
+        priority: 0,
+        candidateText: "",
+        candidateType: "none",
+        shouldStopTts: false,
+        shouldReplan: false,
+      };
+    }
+
+    function draftFromPartial(text) {
+      const t = text.trim();
+      if (!t) return emptyDraft();
+
+      if (["不是", "不对", "等一下", "你先停", "先停", "错了", "纠正"].some((word) => t.includes(word))) {
+        return {
+          intentHypothesis: "user_correction",
+          intentConfidence: 0.9,
+          shortReplyCandidate: "好，我先停一下，刚才那个理解可能不对。",
+          clarificationCandidate: "你纠正的是地点、时间，还是我刚才的结论？",
+          roughFullReplyCandidate: "我会按你最新纠正的信息重新回答。",
+          missingSlots: [],
+          isCorrection: true,
+        };
       }
-      if (text.includes("并行") || text.includes("系统")) {
-        return "这个 demo 的核心是事件驱动状态机。主回复链路负责理解和生成内容，打断链路并行监控语音状态，一旦检测到插话就立即发出停播和重规划信号。";
+
+      if (t.includes("天气")) {
+        const cityWords = ["北京", "上海", "广州", "深圳", "杭州"];
+        const timeWords = ["今天", "明天", "后天", "周末"];
+        const city = cityWords.find((word) => t.includes(word)) || "这个城市";
+        const timeWord = timeWords.find((word) => t.includes(word)) || "对应时间";
+        const missingSlots = [];
+        if (city === "这个城市") missingSlots.push("city");
+        if (timeWord === "对应时间") missingSlots.push("time");
+        return {
+          intentHypothesis: "weather_query",
+          intentConfidence: missingSlots.length ? 0.62 : 0.84,
+          shortReplyCandidate: `${city}${timeWord}的天气我可以直接帮你看。`,
+          clarificationCandidate: weatherClarification(missingSlots),
+          roughFullReplyCandidate: `${city}${timeWord}大概率天气不错，我会补充温度和出行建议。`,
+          missingSlots,
+          isCorrection: false,
+        };
       }
-      if (text.includes("接入")) {
-        return "你可以先用 mock ASR 跑通全链路，再把 ASR、LLM、TTS 分别替换成真实服务。因为模块边界已经隔离，替换成本会比较低。";
+
+      if (["怎么", "如何", "实现", "架构", "并行", "系统"].some((word) => t.includes(word))) {
+        return {
+          intentHypothesis: "architecture_explanation",
+          intentConfidence: t.length >= 10 ? 0.78 : 0.55,
+          shortReplyCandidate: "可以，我先直接说结论。",
+          clarificationCandidate: "你想听整体架构，还是先看打断链路？",
+          roughFullReplyCandidate: "这个系统应该把主回复链路和抢话决策链路拆开，让它们通过共享上下文并行工作。",
+          missingSlots: [],
+          isCorrection: false,
+        };
       }
-      return `收到，你说的是：${text}。我会先基于 partial 草拟，再在 final 到达后给你完整回复。`;
+
+      if (["自我介绍", "你是谁", "介绍一下"].some((word) => t.includes(word))) {
+        return {
+          intentHypothesis: "assistant_intro",
+          intentConfidence: 0.82,
+          shortReplyCandidate: "好，我明白了，你想让我介绍自己。",
+          clarificationCandidate: "",
+          roughFullReplyCandidate: "我是一个用于验证实时抢话和可被打断能力的语音助手 demo。",
+          missingSlots: [],
+          isCorrection: false,
+        };
+      }
+
+      return {
+        intentHypothesis: "general_query",
+        intentConfidence: Math.min(0.35 + t.length / 40, 0.68),
+        shortReplyCandidate: "嗯，我大概明白你的方向了。",
+        clarificationCandidate: "你希望我先回答结论，还是展开解释？",
+        roughFullReplyCandidate: `我理解你的问题和这段内容有关：${t}`,
+        missingSlots: [],
+        isCorrection: false,
+      };
+    }
+
+    function weatherClarification(missingSlots) {
+      if (missingSlots.includes("city") && missingSlots.includes("time")) return "你是想问哪个城市、今天还是明天？";
+      if (missingSlots.includes("city")) return "你是想问北京还是上海，或者其他城市？";
+      if (missingSlots.includes("time")) return "你问的是今天还是明天？";
+      return "我先确认一下，你是在问天气对吗？";
+    }
+
+    function finalReply(text) {
+      const draft = context.currentDraft;
+      if (draft.intentHypothesis === "weather_query") {
+        const city = ["北京", "上海", "广州", "深圳", "杭州"].find((word) => text.includes(word)) || "你说的城市";
+        const timeWord = ["今天", "明天", "后天", "周末"].find((word) => text.includes(word)) || "那个时间";
+        return `${city}${timeWord}我先按 mock 结果回答：天气偏晴，适合出门。我会建议你再确认一下实时天气。`;
+      }
+      if (draft.intentHypothesis === "architecture_explanation") {
+        return "结论是：主回复链路负责理解和生成候选，抢话链路独立评估 partial、停顿和纠正词。Orchestrator 只负责批准话轮切换和停止播放。";
+      }
+      if (draft.intentHypothesis === "assistant_intro") {
+        return "我是一个实验型 voice assistant demo，重点不是模型多聪明，而是验证我能在 partial 阶段草拟、主动抢话，并且被用户打断后立刻重规划。";
+      }
+      if (draft.intentHypothesis === "user_correction") {
+        return "收到，我会以你刚才纠正的内容为准，停止沿用之前的理解，然后重新组织回答。";
+      }
+      return `收到，我按你的完整输入来回答：${text}`;
     }
 
     function dispatch(type, turnId, payload = {}) {
@@ -661,23 +804,35 @@
     function onUserSpeechStarted(event) {
       context.currentTurnId = event.turnId;
       context.userSpeaking = true;
+      context.floorOwner = "user";
       context.latestPartial = "";
       context.latestFinal = "";
+      context.currentDraft = emptyDraft();
       liveEl.innerHTML = "Live transcript: <strong>...</strong>";
       log("[TURN START]", { turnId: event.turnId });
       setAgent("main", "listening", `等待 ${event.turnId} 的 final transcript`);
       setAgent("interrupt", "watching", "用户开始说话，监听 partial 和停顿");
 
       if (context.assistantSpeaking) {
-        interruptCurrentTurn("user_started_while_assistant_speaking");
+        handleFloorDecision({
+          action: "stop_assistant",
+          reason: "speech_started_while_assistant_speaking",
+          confidence: 0.96,
+          priority: 105,
+          candidateText: "",
+          candidateType: "none",
+          shouldStopTts: true,
+          shouldReplan: true,
+        });
       }
-      setState("listening", "user_speech_started");
+      setState("user_speaking", "user_speech_started");
     }
 
     function onUserSpeechStopped(event) {
       context.userSpeaking = false;
       log("[ASR speech stopped]", { turnId: event.turnId });
       setAgent("interrupt", "idle", "用户停止说话，等待下一轮 partial");
+      setState("user_paused", "user_speech_stopped");
       maybeSpeakPending();
     }
 
@@ -688,16 +843,26 @@
       context.latestPartial = text;
       context.lastPartialAt = Date.now();
       liveEl.innerHTML = `Live transcript: <strong>${escapeHtml(text)}</strong>`;
-      log("[ASR partial]", { turnId: event.turnId, text });
+      log("[ASR partial received]", { turnId: event.turnId, text });
 
-      const draft = mockDraft(text);
-      if (draft) {
-        context.responseDraft = draft;
-        setAgent("main", "drafting", draft);
-        log("[Dialogue draft update]", { turnId: event.turnId, draft });
-      }
+      const draft = draftFromPartial(text);
+      context.currentDraft = draft;
+      context.responseDraft = draft.shortReplyCandidate || draft.roughFullReplyCandidate;
+      setAgent("main", "drafting", `${draft.intentHypothesis} ${draft.intentConfidence.toFixed(2)} · ${context.responseDraft}`);
+      log("[Intent hypothesis updated]", {
+        turnId: event.turnId,
+        intent: draft.intentHypothesis,
+        confidence: draft.intentConfidence,
+        missingSlots: draft.missingSlots,
+      });
+      log("[Dialogue draft updated]", {
+        turnId: event.turnId,
+        short: draft.shortReplyCandidate,
+        clarify: draft.clarificationCandidate,
+        roughFull: draft.roughFullReplyCandidate,
+      });
       setAgent("interrupt", "evaluating", `partial=${text.slice(0, 28)}`);
-      evaluateInterrupt();
+      evaluateFloorTaking();
     }
 
     function onFinal(event) {
@@ -706,12 +871,12 @@
       context.latestFinal = text;
       liveEl.innerHTML = `Live transcript: <strong>${escapeHtml(text)}</strong>`;
       addMessage("user", text);
-      log("[ASR final]", { turnId: event.turnId, text });
-      setState("thinking", "final_transcript");
+      log("[ASR final received]", { turnId: event.turnId, text });
+      setState("assistant_preparing", "final_transcript");
       setAgent("main", "thinking", "final transcript 到达，生成完整回复");
 
       window.setTimeout(() => {
-        const reply = mockReply(text);
+        const reply = finalReply(text);
         context.currentResponseText = reply;
         log("[Dialogue final reply]", { turnId: event.turnId, reply });
         setAgent("main", "reply-ready", reply);
@@ -719,52 +884,177 @@
       }, 180);
     }
 
-    function evaluateInterrupt() {
+    function evaluateFloorTaking() {
       const pauseMs = context.lastPartialAt ? Date.now() - context.lastPartialAt : 0;
-      if (context.assistantSpeaking && context.userSpeaking && context.latestPartial.length >= 2) {
-        setAgent("interrupt", "barge-in", "用户在 assistant 播报时插话");
-        interruptCurrentTurn("user_barge_in");
+      const decision = floorTakingPolicy(pauseMs);
+      context.lastFloorDecision = decision;
+
+      if (decision.action === "no_interrupt") {
         return;
       }
-      if (!context.userSpeaking) return;
-      if (context.assistantSpeaking) return;
-      if (Date.now() < context.cooldownUntil) return;
-      if (context.latestPartial.length < 6) return;
-      if (context.seenBackchannelTurns.has(context.currentTurnId)) return;
 
-      window.setTimeout(() => {
-        const delayedPauseMs = Date.now() - context.lastPartialAt;
-        if (!context.userSpeaking) return;
-        if (context.assistantSpeaking) return;
-        if (context.seenBackchannelTurns.has(context.currentTurnId)) return;
-        if (delayedPauseMs < 450 || delayedPauseMs > 1300) return;
-        triggerBackchannel();
-      }, 480);
+      const decisionKey = `${context.currentTurnId}:${decision.action}:${decision.reason}:${decision.candidateType}`;
+      if (decisionKey === context.lastDecisionKey) return;
+      context.lastDecisionKey = decisionKey;
+      handleFloorDecision(decision);
     }
 
-    function triggerBackchannel() {
-      const candidates = ["嗯，我在听。", "好的，你继续。", "明白，接着说。"];
-      const text = candidates[Math.floor(Math.random() * candidates.length)];
-      context.seenBackchannelTurns.add(context.currentTurnId);
-      context.cooldownUntil = Date.now() + 2800;
-      setAgent("interrupt", "backchannel", text);
-      log("[Interrupt approved]", {
-        action: "backchannel",
+    function floorTakingPolicy(pauseMs) {
+      const draft = context.currentDraft;
+
+      if (bargeInPolicy()) {
+        return {
+          action: "stop_assistant",
+          reason: "user_barge_in_while_assistant_speaking",
+          confidence: 0.98,
+          priority: 100,
+          candidateText: "",
+          candidateType: "none",
+          shouldStopTts: true,
+          shouldReplan: true,
+        };
+      }
+
+      if (!context.userSpeaking) return emptyDecision("user_not_speaking");
+      if (context.assistantSpeaking) return emptyDecision("assistant_already_speaking");
+      if (Date.now() < context.cooldownUntil) return emptyDecision("cooldown_active");
+      if (context.takenFloorTurns.has(context.currentTurnId)) return emptyDecision("floor_already_taken_for_turn");
+      if (context.latestPartial.trim().length < 4) return emptyDecision("partial_too_short");
+
+      if (draft.isCorrection && pauseMs >= settings.hardTakeFloorPauseMs) {
+        return {
+          action: "hard_take_floor",
+          reason: "correction_detected",
+          confidence: Math.max(draft.intentConfidence, 0.9),
+          priority: 95,
+          candidateText: draft.shortReplyCandidate,
+          candidateType: "corrective",
+          shouldStopTts: false,
+          shouldReplan: true,
+        };
+      }
+
+      if (draft.missingSlots.length && draft.clarificationCandidate && pauseMs >= settings.clarifyPauseMs) {
+        return {
+          action: "soft_take_floor",
+          reason: `missing_slots:${draft.missingSlots.join(",")}`,
+          confidence: Math.max(draft.intentConfidence, 0.68),
+          priority: 74,
+          candidateText: draft.clarificationCandidate,
+          candidateType: "clarify",
+          shouldStopTts: false,
+          shouldReplan: false,
+        };
+      }
+
+      if (
+        draft.intentConfidence >= settings.softTakeFloorMinConfidence &&
+        draft.shortReplyCandidate &&
+        pauseMs >= settings.softTakeFloorPauseMs
+      ) {
+        return {
+          action: "soft_take_floor",
+          reason: "high_confidence_intent_with_user_pause",
+          confidence: draft.intentConfidence,
+          priority: 70,
+          candidateText: draft.shortReplyCandidate,
+          candidateType: "short",
+          shouldStopTts: false,
+          shouldReplan: false,
+        };
+      }
+
+      if (
+        pauseMs >= settings.backchannelPauseMinMs &&
+        pauseMs <= settings.backchannelPauseMaxMs &&
+        draft.intentConfidence >= settings.backchannelMinConfidence &&
+        !context.seenBackchannelTurns.has(context.currentTurnId)
+      ) {
+        return {
+          action: "backchannel",
+          reason: "short_pause_keep_user_floor",
+          confidence: Math.min(draft.intentConfidence, 0.64),
+          priority: 35,
+          candidateText: "嗯，我在听，你继续。",
+          candidateType: "short",
+          shouldStopTts: false,
+          shouldReplan: false,
+        };
+      }
+
+      return emptyDecision("policy_conditions_not_met");
+    }
+
+    function bargeInPolicy() {
+      if (context.activeTtsTurnId.endsWith("-backchannel")) return false;
+      if (context.activeTtsTurnId.endsWith("-short")) return false;
+      if (context.activeTtsTurnId.endsWith("-clarify")) return false;
+      if (context.activeTtsTurnId.endsWith("-corrective")) return false;
+      return context.assistantSpeaking && context.userSpeaking && context.latestPartial.trim().length >= settings.bargeInTextMinLen;
+    }
+
+    function handleFloorDecision(decision) {
+      context.lastFloorDecision = decision;
+      log("[Floor-taking decision emitted]", {
         turnId: context.currentTurnId,
-        text,
+        decision,
       });
-      speak(`${context.currentTurnId}-bc`, text, { backchannel: true });
+      setAgent("interrupt", decision.action, `${decision.candidateType}: ${decision.reason}`);
+
+      if (decision.shouldStopTts) {
+        log("[Turn revoked from assistant]", { turnId: context.currentTurnId, reason: decision.reason });
+        interruptCurrentTurn(decision.reason);
+        if (decision.shouldReplan) {
+          log("[Replan requested]", { turnId: context.currentTurnId, reason: decision.reason, latestPartial: context.latestPartial });
+        }
+        return;
+      }
+
+      if (!decision.candidateText || context.assistantSpeaking) return;
+
+      if (decision.action === "backchannel") {
+        context.seenBackchannelTurns.add(context.currentTurnId);
+        context.cooldownUntil = Date.now() + settings.proactiveCooldownMs;
+        const messageId = addMessage("assistant", decision.candidateText, "backchannel");
+        log("[Turn granted to assistant]", {
+          type: "backchannel",
+          turnId: context.currentTurnId,
+          reason: decision.reason,
+          candidateType: decision.candidateType,
+          text: decision.candidateText,
+        });
+        speak(`${context.currentTurnId}-backchannel`, decision.candidateText, { backchannel: true, messageId });
+        return;
+      }
+
+      if (decision.action === "soft_take_floor" || decision.action === "hard_take_floor") {
+        context.takenFloorTurns.add(context.currentTurnId);
+        context.cooldownUntil = Date.now() + settings.proactiveCooldownMs;
+        context.floorOwner = "assistant";
+        setState("assistant_preparing", decision.reason);
+        log("[Turn granted to assistant]", {
+          type: decision.action,
+          turnId: context.currentTurnId,
+          reason: decision.reason,
+          candidateType: decision.candidateType,
+          confidence: decision.confidence,
+          text: decision.candidateText,
+        });
+        const messageId = addMessage("assistant", decision.candidateText, decision.candidateType);
+        speak(`${context.currentTurnId}-${decision.candidateType}`, decision.candidateText, { floorTaking: true, messageId });
+      }
     }
 
     function startAssistantReply(turnId, reply) {
       context.activeAssistantMessageId = addMessage("assistant", reply, "speaking");
-      if (context.userSpeaking) {
+      if (context.userSpeaking || context.assistantSpeaking) {
         context.pendingReply = [turnId, reply];
-        setAgent("main", "queued", "用户仍在说话，完整回复暂存");
-        log("[Replan requested]", { turnId, reason: "user_still_speaking" });
-        setState("replanning", "user_still_speaking");
+        setAgent("main", "queued", "完整回复等待话轮释放");
+        log("[Replan requested]", { turnId, reason: "full_reply_waits_for_floor", owner: context.floorOwner });
         return;
       }
+      log("[Turn granted to assistant]", { type: "full_reply", turnId });
+      context.floorOwner = "assistant";
       speak(turnId, reply);
     }
 
@@ -773,6 +1063,8 @@
       const [turnId, reply] = context.pendingReply;
       context.pendingReply = null;
       setAgent("main", "reply-ready", "用户停顿后释放暂存回复");
+      log("[Turn granted to assistant]", { type: "full_reply", turnId, reason: "user_speech_stopped_or_tts_finished" });
+      context.floorOwner = "assistant";
       speak(turnId, reply);
     }
 
@@ -780,9 +1072,10 @@
       stopSpeechOnly("preempt");
       context.assistantSpeaking = true;
       context.activeTtsTurnId = turnId;
+      context.floorOwner = "assistant";
       setAgent("playback", options.backchannel ? "backchannel" : "speaking", text);
       log("[TTS START]", { turnId, text });
-      setState("speaking", "tts_started");
+      setState("assistant_speaking", "tts_started");
 
       if ("speechSynthesis" in window) {
         currentUtterance = new SpeechSynthesisUtterance(text);
@@ -808,14 +1101,19 @@
       }
       log("[TTS FINISHED]", { turnId, interrupted });
       setAgent("playback", interrupted ? "stopped" : "idle", interrupted ? "播报被中断" : "播报完成");
-      if (!options.backchannel && context.activeAssistantMessageId) {
+      if (options.messageId) {
+        updateMessage(options.messageId, { status: interrupted ? "interrupted" : "done" });
+      }
+      if (!options.backchannel && !options.floorTaking && context.activeAssistantMessageId) {
         updateMessage(context.activeAssistantMessageId, { status: interrupted ? "interrupted" : "done" });
       }
       if (interrupted) {
         setState("replanning", "tts_interrupted");
       } else if (context.userSpeaking) {
-        setState("listening", "tts_done_user_speaking");
+        context.floorOwner = "user";
+        setState("user_speaking", "tts_done_user_speaking");
       } else {
+        context.floorOwner = "none";
         setState("idle", "tts_done");
       }
       maybeSpeakPending();
@@ -833,6 +1131,7 @@
       setState("interrupted", reason);
       context.assistantSpeaking = false;
       context.activeTtsTurnId = "";
+      context.floorOwner = "user";
       setState("replanning", `interrupt:${reason}`);
     }
 
@@ -855,12 +1154,18 @@
       context.running = true;
       context.selectedScenario = name;
       context.inputFinished = false;
+      context.floorOwner = "none";
+      context.currentDraft = emptyDraft();
+      context.lastFloorDecision = emptyDecision("scenario_start");
+      context.lastDecisionKey = "";
+      context.seenBackchannelTurns.clear();
+      context.takenFloorTurns.clear();
       setAgent("main", "idle", "等待 ASR final");
       setAgent("interrupt", "watching", "监听 partial 和停顿");
       setAgent("playback", "idle", "等待播报任务");
       setState("listening", "scenario_start");
       const script = name === "all"
-        ? [...scenarios.a, [2100, "user_speech_started", "turn-b", {}], ...scenarios.b.slice(1), [2000, "user_speech_started", "turn-c", {}], ...scenarios.c.slice(1)]
+        ? buildAllScenario()
         : scenarios[name];
 
       let elapsed = 0;
@@ -872,9 +1177,20 @@
       context.timers.push(window.setTimeout(() => dispatch("input_finished", "system", {}), elapsed + 250));
       log("[INPUT START]", { scenario: name });
       interruptTimer = window.setInterval(() => {
-        evaluateInterrupt();
+        evaluateFloorTaking();
         renderDebug();
       }, 250);
+    }
+
+    function buildAllScenario() {
+      const order = ["1", "2", "3", "4", "5"];
+      const out = [];
+      for (const [index, key] of order.entries()) {
+        const script = scenarios[key].map((step) => [...step]);
+        if (index > 0) script[0][0] += 7000;
+        out.push(...script);
+      }
+      return out;
     }
 
     function stopAll(clearMessages = false) {
@@ -890,6 +1206,14 @@
       context.assistantSpeaking = false;
       context.activeTtsTurnId = "";
       context.pendingReply = null;
+      context.floorOwner = "none";
+      context.currentDraft = emptyDraft();
+      context.lastFloorDecision = emptyDecision("stop_all");
+      context.lastDecisionKey = "";
+      context.latestPartial = "";
+      context.latestFinal = "";
+      context.seenBackchannelTurns.clear();
+      context.takenFloorTurns.clear();
       setAgent("main", "idle", "已停止");
       setAgent("interrupt", "idle", "已停止");
       setAgent("playback", "idle", "已停止");

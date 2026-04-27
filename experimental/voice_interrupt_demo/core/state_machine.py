@@ -10,8 +10,11 @@ logger = get_logger("state")
 class AssistantState(StrEnum):
     IDLE = "idle"
     LISTENING = "listening"
+    USER_SPEAKING = "user_speaking"
+    USER_PAUSED = "user_paused"
     THINKING = "thinking"
-    SPEAKING = "speaking"
+    ASSISTANT_PREPARING = "assistant_preparing"
+    ASSISTANT_SPEAKING = "assistant_speaking"
     INTERRUPTED = "interrupted"
     REPLANNING = "replanning"
 

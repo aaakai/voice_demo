@@ -1,15 +1,48 @@
-# Voice Interrupt Demo (Experimental)
+# Voice Interrupt Demo
 
-这是一个独立的 Python 实验项目，用于验证：
+这是一个独立实验 demo，用来验证“可主动抢话 / 可被打断 / 双链路并行决策”的实时语音 assistant 架构。
 
-1. 主回复链路（Dialogue）和打断链路（Interrupt）并行运行。
-2. 系统可基于 partial transcript 先产生草拟响应。
-3. 用户停顿时，系统可短促接话（backchannel）。
-4. 系统播报中用户插话时，可立即停播并重规划。
+当前版本优先使用 mock transcript、mock LLM、mock TTS，不依赖真实麦克风或模型服务。重点是让行为清楚可观察：partial 阶段草拟、停顿时主动接话、缺槽时主动追问、纠正时强制抢话、assistant 播报中被用户打断后立即停播并重规划。
 
-> 注意：当前版本是 mock-first，可直接运行观察事件流与状态机行为，不依赖真实 ASR/LLM/TTS。
+## 架构
 
-## 模块结构
+主回复链路 `Dialogue Pipeline`：
+
+- 消费 `partial_transcript` 和 `final_transcript`
+- partial 阶段生成 `DialogueDraft`
+- 输出 `intent_hypothesis`
+- 输出 `short_reply_candidate`
+- 输出 `clarification_candidate`
+- 输出 `rough_full_reply_candidate`
+- final 阶段生成完整回复
+
+抢话/打断链路 `Floor-Taking Pipeline`：
+
+- 独立轮询 `SharedContext`
+- 读取 latest partial、pause duration、user/assistant speaking、draft candidates
+- 输出结构化 `FloorDecision`
+- 支持 `no_interrupt / backchannel / soft_take_floor / hard_take_floor / stop_assistant`
+
+中心调度 `Orchestrator / Turn Manager`：
+
+- 管理当前话轮所有权 `floor_owner`
+- 批准或拒绝 assistant 主动抢话
+- 播报中用户开口时撤销 assistant 话轮
+- 触发 stop TTS 和 replan
+- 输出状态机切换日志
+
+状态机：
+
+- `idle`
+- `listening`
+- `user_speaking`
+- `user_paused`
+- `assistant_preparing`
+- `assistant_speaking`
+- `interrupted`
+- `replanning`
+
+## 文件树
 
 ```text
 experimental/voice_interrupt_demo/
@@ -17,136 +50,175 @@ experimental/voice_interrupt_demo/
 ├── config.py
 ├── requirements.txt
 ├── README.md
-├── audio/
-│   ├── __init__.py
-│   ├── input_stream.py
-│   └── vad.py
-├── asr/
-│   ├── __init__.py
-│   ├── asr_interface.py
-│   └── mock_asr.py
+├── scenarios/
+│   ├── base.py
+│   ├── scenario_1_normal.py
+│   ├── scenario_2_pause_take_floor.py
+│   ├── scenario_3_user_barge_in.py
+│   ├── scenario_4_early_clarify.py
+│   └── scenario_5_corrective_interrupt.py
 ├── core/
-│   ├── __init__.py
 │   ├── context.py
+│   ├── decisions.py
 │   ├── events.py
 │   ├── orchestrator.py
 │   └── state_machine.py
+├── asr/
+│   ├── asr_interface.py
+│   ├── mock_asr.py
+│   └── mock_streaming_asr.py
 ├── dialogue/
-│   ├── __init__.py
 │   ├── dialogue_interface.py
 │   ├── dialogue_worker.py
-│   └── mock_llm.py
+│   ├── mock_llm.py
+│   └── response_drafter.py
 ├── interrupt/
-│   ├── __init__.py
+│   ├── barge_in_policy.py
+│   ├── floor_taking_policy.py
 │   ├── interrupt_worker.py
 │   └── policies.py
 ├── tts/
-│   ├── __init__.py
 │   ├── mock_tts.py
 │   ├── playback_controller.py
 │   └── tts_interface.py
 └── utils/
-    ├── __init__.py
+    ├── clocks.py
+    ├── ids.py
     ├── logger.py
     └── timers.py
 ```
 
-## 事件流
-
-- `mock_asr` 输出：
-  - `user_speech_started`
-  - `partial_transcript`
-  - `final_transcript`
-  - `user_speech_stopped`
-- `orchestrator` 统一消费事件并更新状态。
-- `dialogue_worker`（并行）消费 partial/final：
-  - partial -> `response_draft_updated`
-  - final -> `response_ready`
-- `interrupt_worker`（并行）轮询共享上下文：
-  - 触发 `interrupt_requested`（用户打断）
-  - 或 `interrupt_approved`（主动 backchannel）
-- `playback_controller` 处理播报：
-  - `tts_started`
-  - `tts_finished`
-
-## 状态机
-
-状态：`idle -> listening -> thinking -> speaking -> interrupted -> replanning`
-
-`orchestrator` 统一输出状态切换日志，便于观察：
-
-- 正常路径：`listening -> thinking -> speaking -> idle`
-- 用户打断路径：`speaking -> interrupted -> replanning -> listening/thinking`
-
 ## 运行
 
-### 浏览器测试页
-
-可以直接打开：
-
-```text
-/Users/sunjingkai/Desktop/agentic/experimental/voice_interrupt_demo/web_demo.html
-```
-
-也可以用静态服务器打开：
+当前没有第三方运行依赖。
 
 ```bash
 cd /Users/sunjingkai/Desktop/agentic/experimental/voice_interrupt_demo
-python3 -m http.server 8765
+python3 app.py --scenario 1 --log-level INFO
 ```
 
-然后访问：
+## Scenarios
 
-```text
-http://127.0.0.1:8765/web_demo.html
-```
-
-这个页面使用浏览器内 mock ASR 和 `speechSynthesis`，用于观察 partial、draft、backchannel、用户打断 assistant、状态切换和事件日志。
-
-### 1) 安装依赖
+Scenario 1: 正常完整问答
 
 ```bash
-cd /Users/sunjingkai/Desktop/agentic/experimental/voice_interrupt_demo
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+python3 app.py --scenario 1 --log-level INFO
 ```
 
-### 2) 启动
+预期看到：partial 阶段已经有 draft，final 后 assistant 获取话轮并完整回答。
+
+Scenario 2: 用户停顿，assistant 主动提前短答
 
 ```bash
-python app.py --scenario all --log-level INFO
+python3 app.py --scenario 2 --log-level INFO
 ```
 
-可选场景：
+预期看到：
+
+- `[Intent hypothesis updated] intent=weather_query`
+- `[Floor-taking decision emitted] action=soft_take_floor`
+- `[Turn granted to assistant] type=soft_take_floor`
+- assistant 在 final 前先说短回复
+
+Scenario 3: assistant 说话时用户打断
 
 ```bash
-python app.py --scenario a
-python app.py --scenario b
-python app.py --scenario c
+python3 app.py --scenario 3 --log-level INFO
 ```
 
-## 如何验证 3 个核心场景
+预期看到：
 
-### 场景 A：正常对话
-- 观察 `ASR partial` -> `ASR final` -> `Dialogue final reply` -> `TTS START/DONE`。
+- assistant 先开始长回复
+- 用户 `speech_started`
+- `[Floor-taking decision emitted] action=stop_assistant`
+- `[Turn revoked from assistant]`
+- `[TTS STOPPED] during_chunk`
+- 新输入 final 后重新规划回复
 
-### 场景 B：用户停顿短接话
-- 在用户 still speaking 且 partial 有停顿时，观察：
-  - `Interrupt approved action=backchannel`
-  - 随后有短 TTS 播放。
+Scenario 4: 用户说到一半，assistant 提前追问
 
-### 场景 C：用户打断系统
-- 在 assistant 播报中用户再次开口时，观察：
-  - `INTERRUPT requested`
-  - `STOP TTS`
-  - `PCM STOP`
-  - 然后新一轮 `ASR final` 与回复生成。
+```bash
+python3 app.py --scenario 4 --log-level INFO
+```
 
-## 后续替换建议
+预期看到：
 
-- 替换 `asr/mock_asr.py` 为真实 streaming ASR 实现。
-- 替换 `dialogue/mock_llm.py` 为真实 LLM 客户端。
-- 替换 `tts/mock_tts.py` 为真实 TTS 服务。
+- partial 是“我想问天气”
+- draft 中 `missing=city,time`
+- decision 为 `soft_take_floor`
+- `candidate_type=clarify`
+- assistant 主动追问“你是想问哪个城市、今天还是明天？”
 
-核心并行结构无需改动，只需替换接口实现。
+Scenario 5: 用户纠正系统，assistant 强制抢话纠偏
+
+```bash
+python3 app.py --scenario 5 --log-level INFO
+```
+
+预期看到：
+
+- partial 出现“不是 / 不对”
+- decision 为 `hard_take_floor`
+- `candidate_type=corrective`
+- assistant 主动说“好，我先停一下，刚才那个理解可能不对。”
+
+运行全部：
+
+```bash
+python3 app.py --scenario all --log-level INFO
+```
+
+## 关键日志
+
+重点观察这些日志：
+
+- `[ASR partial received]`
+- `[ASR final received]`
+- `[Intent hypothesis updated]`
+- `[Dialogue draft updated]`
+- `[Floor-taking decision emitted]`
+- `[Turn granted to assistant]`
+- `[Turn revoked from assistant]`
+- `[TTS started]`
+- `[TTS STOPPED]`
+- `[Replan requested]`
+- `[STATE]`
+
+## 调策略
+
+抢话阈值集中在 [config.py](/Users/sunjingkai/Desktop/agentic/experimental/voice_interrupt_demo/config.py)：
+
+- `soft_take_floor_pause_ms`
+- `hard_take_floor_pause_ms`
+- `clarify_pause_ms`
+- `soft_take_floor_min_confidence`
+- `hard_take_floor_min_confidence`
+- `proactive_cooldown_ms`
+
+策略实现集中在：
+
+- [floor_taking_policy.py](/Users/sunjingkai/Desktop/agentic/experimental/voice_interrupt_demo/interrupt/floor_taking_policy.py)
+- [barge_in_policy.py](/Users/sunjingkai/Desktop/agentic/experimental/voice_interrupt_demo/interrupt/barge_in_policy.py)
+
+候选回复生成集中在：
+
+- [response_drafter.py](/Users/sunjingkai/Desktop/agentic/experimental/voice_interrupt_demo/dialogue/response_drafter.py)
+
+## 浏览器测试页
+
+保留了一个轻量 mock 页面：
+
+```bash
+open /Users/sunjingkai/Desktop/agentic/experimental/voice_interrupt_demo/web_demo.html
+```
+
+这个页面现在也使用同一套 mock 场景和决策结构，可直接观察：
+
+- `DialogueDraft`
+- `FloorDecision`
+- `soft_take_floor`
+- `hard_take_floor`
+- `stop_assistant`
+- 主 Agent / 抢话子 Agent / 播放控制器的状态切换
+
+核心行为仍以 Python scenario 日志为准，网页适合做交互观察和演示。

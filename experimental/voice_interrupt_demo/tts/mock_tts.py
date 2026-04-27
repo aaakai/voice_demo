@@ -23,7 +23,14 @@ class MockTTS:
                 logger.info("[TTS STOPPED] before_chunk=%s", idx)
                 return
             logger.info("[TTS CHUNK] %s", chunk)
-            await asyncio.sleep(max(len(chunk) / self.chars_per_second, 0.12))
+            remaining = max(len(chunk) / self.chars_per_second, 0.12)
+            while remaining > 0:
+                if stop_event.is_set():
+                    logger.info("[TTS STOPPED] during_chunk=%s", idx)
+                    return
+                step = min(remaining, 0.05)
+                await asyncio.sleep(step)
+                remaining -= step
         logger.info("[TTS DONE] text_len=%s", len(text))
 
     def _chunk_text(self, text: str) -> list[str]:

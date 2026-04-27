@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import logging
 
-from asr.mock_asr import MockASRProvider
+from asr.mock_streaming_asr import MockStreamingASR
 from audio.input_stream import InputStreamController
 from config import Settings
 from core.context import SharedContext
@@ -21,12 +21,7 @@ from utils.logger import setup_logging
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Voice interrupt demo (mock)")
     parser.add_argument("--mode", default="mock", choices=["mock"], help="Input mode")
-    parser.add_argument(
-        "--scenario",
-        default="all",
-        choices=["a", "b", "c", "all"],
-        help="Mock scenario",
-    )
+    parser.add_argument("--scenario", default="all", help="1/2/3/4/5/all or named scenario")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser.parse_args()
 
@@ -40,7 +35,7 @@ async def main_async() -> None:
     context = SharedContext(session_id=settings.session_id)
     event_factory = EventFactory(session_id=settings.session_id)
 
-    asr_provider = MockASRProvider(event_factory=event_factory, scenario=settings.scenario)
+    asr_provider = MockStreamingASR(event_factory=event_factory, scenario_name=settings.scenario)
     input_stream = InputStreamController(asr_provider)
 
     dialogue_worker = DialogueWorker(

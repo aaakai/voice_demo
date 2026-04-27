@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import random
 from typing import Awaitable, Callable
 
 from config import Settings
 from core.context import SharedContext
 from core.events import Event, EventFactory, EventType
-from interrupt.policies import BACKCHANNEL_CANDIDATES, should_offer_backchannel, should_request_barge_in
+from core.decisions import FloorAction
+from interrupt.floor_taking_policy import FloorTakingPolicy
 from utils.logger import get_logger
-from utils.timers import elapsed_ms, now_ts
 
 logger = get_logger("interrupt")
 EmitFn = Callable[[Event], Awaitable[None]]
@@ -25,8 +24,9 @@ class InterruptWorker:
         self.context = context
         self.settings = settings
         self.event_factory = event_factory
+        self.policy = FloorTakingPolicy(settings)
         self._task: asyncio.Task[None] | None = None
-        self._last_barge_in_turn_id: str = ""
+        self._last_decision_key: str = ""
 
     async def start(self, emit: EmitFn) -> None:
         if self._task and not self._task.done():
@@ -42,7 +42,7 @@ class InterruptWorker:
                 pass
 
     async def _run(self, emit: EmitFn) -> None:
-        poll_s = self.settings.interrupt_poll_ms / 1000
+        poll_s = self.settings.floor_policy_poll_ms / 1000
         while True:
             await asyncio.sleep(poll_s)
             await self._evaluate(emit)
@@ -52,53 +52,26 @@ class InterruptWorker:
         if not turn_id:
             return
 
-        if should_request_barge_in(self.context, self.settings.barge_in_text_min_len):
-            if self._last_barge_in_turn_id != turn_id:
-                self._last_barge_in_turn_id = turn_id
-                logger.info("[Interrupt trigger] reason=user_barge_in turn=%s", turn_id)
-                await emit(
-                    self.event_factory.make(
-                        EventType.INTERRUPT_REQUESTED,
-                        turn_id,
-                        {"reason": "user_barge_in"},
-                    )
-                )
+        decision = self.policy.evaluate(self.context)
+        self.context.last_floor_decision = decision
+
+        if decision.action == FloorAction.NO_INTERRUPT:
             return
 
-        if self.context.last_partial_ts <= 0:
+        decision_key = f"{turn_id}:{decision.action}:{decision.reason}:{decision.candidate_type}"
+        if decision_key == self._last_decision_key:
             return
+        self._last_decision_key = decision_key
 
-        pause_ms = elapsed_ms(self.context.last_partial_ts)
-        if not should_offer_backchannel(
-            self.context,
-            pause_ms=pause_ms,
-            text_len_min=self.settings.proactive_text_min_len,
-            pause_min_ms=self.settings.proactive_pause_min_ms,
-            pause_max_ms=self.settings.proactive_pause_max_ms,
-        ):
-            return
-
-        if turn_id in self.context.seen_backchannel_turns:
-            return
-
-        backchannel = random.choice(BACKCHANNEL_CANDIDATES)
-        self.context.seen_backchannel_turns.add(turn_id)
-        self.context.proactive_cooldown_until = now_ts() + (self.settings.proactive_cooldown_ms / 1000)
         logger.info(
-            "[Interrupt approved] action=backchannel turn=%s pause_ms=%s text=%s",
+            "[Floor-taking decision emitted] turn=%s decision=%s",
             turn_id,
-            pause_ms,
-            self.context.latest_partial,
+            decision.to_dict(),
         )
         await emit(
             self.event_factory.make(
-                EventType.INTERRUPT_APPROVED,
+                EventType.FLOOR_DECISION_EMITTED,
                 turn_id,
-                {
-                    "action": "backchannel",
-                    "reply": backchannel,
-                    "reason": "user_pause_detected",
-                    "pause_ms": str(pause_ms),
-                },
+                {"decision": decision.to_dict()},
             )
         )
